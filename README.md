@@ -2,7 +2,7 @@
 
 **AI SDK that acts before you ask**
 
-로컬 LLM 기반으로 대화 상태를 스스로 추론하고, 사용자가 묻기 전에 먼저 대화를 이끄는 오픈소스 Python SDK.
+로컬 LLM 기반으로 임베딩 유사도로 대화 상태를 감지하고, 사용자가 묻기 전에 먼저 대화를 이끄는 오픈소스 Python SDK.
 
 ---
 
