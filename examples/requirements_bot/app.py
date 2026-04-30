@@ -9,6 +9,7 @@ import streamlit as st
 
 from vela.agent import VelaAgent
 from vela.core.state import ConversationState
+from vela.core.wfc import CellState
 
 _STATE_LABELS = {
     ConversationState.EXPLORING: ("🔍 탐색 중", "blue"),
@@ -26,16 +27,17 @@ def _get_agent() -> VelaAgent:
 def main() -> None:
     st.set_page_config(page_title="Requirements Bot", page_icon="📋", layout="centered")
     st.title("📋 Requirements Bot")
-    st.caption("요구사항 명세서를 업로드하면 Vela가 먼저 분석하고 논의를 이끕니다.")
+    st.caption("요구사항 명세서를 업로드하면 Vela가 먼저 분석하고 대화 공간을 구성합니다.")
 
-    if "req_messages" not in st.session_state:
-        st.session_state.req_messages = []
-    if "analyzed_files" not in st.session_state:
-        st.session_state.analyzed_files = set()
-    if "last_suggestions" not in st.session_state:
-        st.session_state.last_suggestions = []
-    if "suggestion_key" not in st.session_state:
-        st.session_state.suggestion_key = 0
+    defaults = {
+        "req_messages": [],
+        "analyzed_files": set(),
+        "last_suggestions": [],
+        "suggestion_key": 0,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
     agent = _get_agent()
 
@@ -54,21 +56,13 @@ def main() -> None:
                 try:
                     count = agent.load_document(tmp_path)
                     st.success(f"✅ 로드 완료 — {count}개 청크")
-                    with st.spinner("명세서 분석 중..."):
+                    with st.spinner("명세서 분석 + 대화 공간 구성 중..."):
                         analysis = agent.analyze_document()
-                    with st.spinner("논의 계획 수립 중..."):
-                        agent.generate_agenda()
-                    first_item = agent.advance_agenda()
-
                     st.session_state.analyzed_files.add(file_key)
                     st.session_state.last_suggestions = []
                     if analysis:
                         st.session_state.req_messages.append(
-                            {"role": "assistant", "content": analysis, "proactive": True}
-                        )
-                    if first_item:
-                        st.session_state.req_messages.append(
-                            {"role": "assistant", "content": first_item, "proactive": True, "agenda": True}
+                            {"role": "assistant", "content": analysis, "tag": "📄 명세서 분석"}
                         )
                     st.rerun()
                 except Exception as e:
@@ -76,19 +70,25 @@ def main() -> None:
                 finally:
                     os.unlink(tmp_path)
 
-        # 논의 계획 진행 상황
-        agenda = agent.get_agenda()
-        if agenda:
+        # WFC 대화 공간 시각화
+        cells = agent.get_wfc_cells()
+        if cells:
             st.divider()
-            idx = agent.get_agenda_index()
-            st.header(f"논의 계획 ({min(idx, len(agenda))}/{len(agenda)})")
-            for i, item in enumerate(agenda):
-                if i < idx:
-                    st.markdown(f"✅ ~~{item}~~")
-                elif i == idx:
-                    st.markdown(f"▶️ **{item}**")
+            next_cell = agent.get_wfc_next()
+            n_collapsed = sum(1 for c in cells if c.state == CellState.COLLAPSED)
+            st.header(f"대화 공간 ({n_collapsed}/{len(cells)})")
+            sorted_cells = sorted(
+                cells,
+                key=lambda c: (c.state == CellState.COLLAPSED, c.entropy),
+            )
+            for cell in sorted_cells:
+                if cell.state == CellState.COLLAPSED:
+                    st.markdown(f"✅ ~~{cell.topic}~~")
+                elif next_cell and cell.topic == next_cell.topic:
+                    st.markdown(f"▶️ **{cell.topic}**")
+                    st.caption(cell.description)
                 else:
-                    st.markdown(f"○ {item}")
+                    st.markdown(f"○ {cell.topic}")
 
         if st.button("초기화"):
             agent.reset()
@@ -101,16 +101,12 @@ def main() -> None:
     for msg in st.session_state.req_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg.get("agenda"):
-                st.caption("📋 Vela Agenda — 능동 진행")
-            elif msg.get("proactive") and msg["role"] == "assistant":
-                st.caption("🎯 Vela 능동 분석")
-            elif msg.get("state"):
-                s = msg["state"]
-                label, color = _STATE_LABELS[s]
+            if tag := msg.get("tag"):
+                st.caption(tag)
+            elif state := msg.get("state"):
+                label, color = _STATE_LABELS[state]
                 st.caption(f":{color}[{label}]")
 
-    # 선제 질문 버튼
     suggestions = st.session_state.last_suggestions
     if suggestions:
         st.markdown("**💡 다음 질문 제안:**")
@@ -147,21 +143,25 @@ def main() -> None:
         )
 
         proactive_msg = None
+        proactive_tag = None
+
         if state in (ConversationState.LOOPING, ConversationState.STUCK):
             with st.spinner("Vela 개입 중..."):
                 proactive_msg = agent.proactive_nudge(state)
-        elif agent.has_agenda():
-            with st.spinner("다음 주제 준비 중..."):
-                proactive_msg = agent.advance_agenda()
+            proactive_tag = f":{color}[{label}] — 🎯 능동 개입"
+        elif agent.get_wfc_next():
+            with st.spinner("다음 주제 꺼내는 중..."):
+                proactive_msg = agent.wfc_proactive()
+            next_cell = agent.get_wfc_next()
+            proactive_tag = f"🌊 WFC — {next_cell.topic if next_cell else '대화 공간 탐색'}"
 
         if proactive_msg:
-            is_agenda = state not in (ConversationState.LOOPING, ConversationState.STUCK)
             with st.chat_message("assistant"):
                 st.markdown(proactive_msg)
-                st.caption("📋 Vela Agenda — 능동 진행" if is_agenda else f":{color}[{label}] — 🎯 능동 개입")
+                st.caption(proactive_tag or "🎯 Vela 능동 개입")
             st.session_state.req_messages.append(
-                {"role": "assistant", "content": proactive_msg, "state": state,
-                 "proactive": True, "agenda": is_agenda}
+                {"role": "assistant", "content": proactive_msg,
+                 "state": state, "tag": proactive_tag}
             )
         else:
             with st.spinner("질문 제안 중..."):

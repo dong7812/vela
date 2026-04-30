@@ -23,15 +23,6 @@ class OllamaLLM(BaseLLM):
         resp.raise_for_status()
         return resp.json()["message"]["content"]
 
-    def embed(self, text: str) -> list[float]:
-        resp = requests.post(
-            f"{_BASE_URL}/api/embeddings",
-            json={"model": self.model, "prompt": text},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["embedding"]
-
     def is_available(self) -> bool:
         try:
             resp = requests.get(f"{_BASE_URL}/api/tags", timeout=5)

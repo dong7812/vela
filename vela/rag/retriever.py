@@ -45,6 +45,3 @@ class Retriever:
         )
         return results["documents"][0] if results["documents"] else []
 
-    def clear(self) -> None:
-        self._client.delete_collection(COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(COLLECTION_NAME)

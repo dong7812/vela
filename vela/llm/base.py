@@ -7,9 +7,5 @@ class BaseLLM(ABC):
         ...
 
     @abstractmethod
-    def embed(self, text: str) -> list[float]:
-        ...
-
-    @abstractmethod
     def is_available(self) -> bool:
         ...
