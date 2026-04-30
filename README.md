@@ -11,33 +11,65 @@
 | | ChatGPT / Claude | **Vela** |
 |---|---|---|
 | 대화 시작 | 사용자가 먼저 | **Vela가 먼저** (문서 로드 시 자동 분석) |
-| 반복 감지 | 없음 | **LOOPING/STUCK 상태 감지 → 즉시 개입** |
-| 논의 흐름 | 사용자 주도 | **Agenda 자동 생성 → LLM이 순서대로 이끌어감** |
+| 논의 흐름 | 사용자 주도 | **WFC로 대화 공간 구성 → entropy 순서로 이끌어감** |
+| 반복/막힘 | 없음 | **LOOPING/STUCK 감지 → 즉시 방향 전환** |
 | 다음 질문 | 없음 | **선제 질문 버튼 자동 생성** |
 
 ```
 [사용자가 문서 업로드]
 
-[🎯 Vela] 문서를 분석했습니다. 주요 요구사항 3가지를 발견했으며,
-          '인증 없는 접근 범위'가 모호합니다. 먼저 이 부분을 명확히 할까요?
+[📄 Vela] 문서를 분석했습니다. '인증 없는 접근 범위'가 모호하고,
+          요구사항 3번과 7번이 충돌 가능성이 있습니다.
 
-[📋 Vela] 논의 계획 1번 — 백엔드 없는 정적 파일 구조에 대해 얘기해봅시다.
+[🌊 WFC ] 먼저 '백엔드 없는 정적 파일 구조'에 대해 이야기해봅시다.
           배포 환경에서 상태 관리는 어떻게 처리하실 계획인가요?
 
-[사용자] ...
+[사용자] 로컬 스토리지를 활용하려고 합니다.
+
+[🌊 WFC ] 그렇다면 다음 주제인 '연락 폼 이메일 전송 방식'을 살펴볼게요.
+          백엔드 없이 이메일을 보내려면 외부 서비스가 필요한데, 생각해두신 게 있나요?
 ```
 
 ---
 
-## 핵심 개념: 대화 상태 감지
+## 핵심 개념
 
-최근 N턴의 발화를 임베딩해 코사인 유사도로 대화 상태를 실시간 판단합니다.
+### 1. WFC 기반 대화 공간
+
+대화가 시작되면 LLM이 맥락을 분석해 논의해야 할 주제 셀을 생성합니다. 이후 WFC(Wave Function Collapse) 알고리즘으로 어떤 주제를 먼저 꺼낼지 결정합니다.
+
+- 각 셀은 `entropy` 값을 가집니다. 낮을수록 먼저 논의할 주제
+- 한 셀이 논의되면 관련 셀의 entropy가 갱신됩니다 (constraint propagation)
+- 사용자가 어떤 주제를 언급했는지 임베딩 유사도로 감지해 자동으로 셀을 collapse
 
 ```
-EXPLORING  → 새로운 주제 탐색 중       (정상)
-DEEPENING  → 주제 심화 중             (정상)
-LOOPING    → 같은 말 반복 중          → 능동 개입
+대화 공간 (2/6 탐색됨)
+✅  ~~백엔드 구조~~
+✅  ~~이메일 전송 방식~~
+▶️  포트폴리오 접근 범위   ← entropy 최저, 다음 주제
+○   상태 관리 전략
+○   배포 옵션
+○   보안 고려사항
+```
+
+### 2. 대화 상태 감지
+
+최근 N턴의 발화를 임베딩해 코사인 유사도로 대화 상태를 판단합니다. WFC보다 우선순위가 높아 대화가 나빠지면 즉시 개입합니다.
+
+```
+EXPLORING  → 새로운 주제 탐색 중       (WFC가 다음 셀 제시)
+DEEPENING  → 주제 심화 중             (WFC가 다음 셀 제시)
+LOOPING    → 같은 말 반복 중          → 능동 개입 (WFC 우선순위 밀림)
 STUCK      → 완전히 막힘             → 즉시 방향 전환
+```
+
+### 3. 능동 후속 우선순위
+
+```
+매 응답 후:
+  1순위 LOOPING/STUCK  → proactive_nudge()  방향 전환 개입
+  2순위 WFC 셀 남음    → wfc_proactive()    다음 주제 선제 제시
+  3순위 WFC 소진       → suggest_questions() 선제 질문 버튼 3개
 ```
 
 ---
@@ -56,7 +88,7 @@ pip install -r requirements.txt
 
 # 3. Ollama 설치 및 모델 준비
 # https://ollama.com 에서 Ollama 설치 후:
-ollama pull qwen2.5:3b   # RAM 8GB 이상 권장 (최소 4GB)
+ollama pull qwen2.5:3b
 ```
 
 > **RAM 가이드**
@@ -90,21 +122,18 @@ from vela import VelaAgent
 
 agent = VelaAgent()
 
-# 문서 로드 → 자동 분석 + 논의 계획 생성
+# 문서 로드 → 자동 분석 + WFC 대화 공간 초기화
 agent.load_document("requirements.pdf")
-analysis = agent.analyze_document()   # 사용자 입력 없이 먼저 발화
-agenda   = agent.generate_agenda()    # ['항목1', '항목2', ...]
-first    = agent.advance_agenda()     # 첫 번째 주제로 대화 시작
+analysis = agent.analyze_document()  # 사용자 입력 없이 먼저 발화 + WFC 초기화
 
-# 대화
+# 대화 (매 턴마다 WFC 셀 자동 감지 및 collapse)
 response, state = agent.chat("질문 내용")
 print(f"상태: {state}")  # EXPLORING / DEEPENING / LOOPING / STUCK
 
-# 상태 기반 능동 개입
-nudge = agent.proactive_nudge(state)   # LOOPING/STUCK이면 개입 메시지, 아니면 None
-
-# 선제 질문 생성 (Agenda 완료 후)
-questions = agent.suggest_questions()  # ['질문1', '질문2', '질문3']
+# 능동 후속 — 우선순위대로 호출
+nudge = agent.proactive_nudge(state)     # LOOPING/STUCK이면 개입, 아니면 None
+wfc   = agent.wfc_proactive()            # 다음 WFC 셀 선제 발화, 소진 시 None
+qs    = agent.suggest_questions()        # fallback: 선제 질문 3개
 ```
 
 ### 커스텀 LLM 연결
@@ -114,8 +143,6 @@ from vela.llm.base import BaseLLM
 
 class MyLLM(BaseLLM):
     def chat(self, messages: list[dict], system: str = "") -> str:
-        ...
-    def embed(self, text: str) -> list[float]:
         ...
     def is_available(self) -> bool:
         ...
@@ -131,6 +158,7 @@ agent = VelaAgent(llm=MyLLM())
 vela/
 ├── agent.py              # VelaAgent — 전체 파이프라인 진입점
 ├── core/
+│   ├── wfc.py            # WFC 엔진 (ConversationWFC, ConversationCell)
 │   ├── embedder.py       # 임베딩 + 코사인 유사도 (sentence-transformers)
 │   ├── context.py        # 대화 컨텍스트 윈도우 관리
 │   └── state.py          # 대화 상태 감지 (StateDetector)
@@ -164,7 +192,7 @@ PR 환영합니다. 아래 항목을 우선적으로 기여해주세요:
 
 - [ ] OpenAI / Claude API LLM 구현체 추가 (`llm/` 하위에 `BaseLLM` 상속)
 - [ ] 스트리밍 응답 UI 반영
-- [ ] 상태 감지 임계값 튜닝 가이드
+- [ ] WFC entropy 튜닝 가이드
 - [ ] 영어 문서화
 
 ```bash
