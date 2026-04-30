@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Vela 로컬 데이터
+.vela_db/
+
+# 모델 캐시 (sentence-transformers, huggingface)
+.cache/
+~/.cache/huggingface/
+
+# 환경 변수
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Streamlit
+.streamlit/
+
+# 업로드 임시 파일
+*.tmp
+tmp/
