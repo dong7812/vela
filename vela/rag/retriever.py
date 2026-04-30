@@ -34,7 +34,7 @@ class Retriever:
                 metadatas=[{"source": source} for _ in new_docs],
             )
 
-    def search(self, query: str, top_k: int = TOP_K) -> list[str]:
+    def search(self, query: str, top_k: int = TOP_K, distance_threshold: float = 1.0) -> list[str]:
         count = self._collection.count()
         if count == 0:
             return []
@@ -42,6 +42,13 @@ class Retriever:
         results = self._collection.query(
             query_texts=[query],
             n_results=min(top_k, count),
+            include=["documents", "distances"],
         )
-        return results["documents"][0] if results["documents"] else []
+        if not results["documents"]:
+            return []
+
+        return [
+            doc for doc, dist in zip(results["documents"][0], results["distances"][0])
+            if dist < distance_threshold
+        ]
 

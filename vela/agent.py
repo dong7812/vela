@@ -166,6 +166,13 @@ class VelaAgent:
 
     # ── 대화 ─────────────────────────────────────────────────────────────
 
+    def is_wfc_initialized(self) -> bool:
+        return self._wfc.is_initialized()
+
+    def init_wfc(self) -> None:
+        """대화 맥락 기반 WFC 초기화 — UI에서 chat() 직후 별도 호출."""
+        self._init_wfc()
+
     def chat(self, user_input: str) -> tuple[str, ConversationState]:
         self._context.add("user", user_input)
         rag_results = self._retriever.search(user_input)
@@ -178,11 +185,10 @@ class VelaAgent:
         response = self._llm.chat(self._context.to_messages(), system=system)
         self._context.add("assistant", response)
 
-        # WFC: 첫 응답 후 초기화 (문서 없을 때) + 논의된 셀 collapse
-        if not self._wfc.is_initialized():
-            self._init_wfc()
-        for topic in self._detect_discussed_cells(user_input):
-            self._wfc.collapse(topic)
+        # WFC가 초기화된 경우에만 논의된 셀 collapse
+        if self._wfc.is_initialized():
+            for topic in self._detect_discussed_cells(user_input):
+                self._wfc.collapse(topic)
 
         return response, state
 
