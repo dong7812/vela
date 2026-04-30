@@ -1,8 +1,10 @@
+import json
 import re
 
 from vela.core.context import ContextWindow
 from vela.core.embedder import Embedder
 from vela.core.state import ConversationState, StateDetector
+from vela.core.wfc import CellState, ConversationCell, ConversationWFC
 from vela.llm.base import BaseLLM
 from vela.llm.ollama import OllamaLLM
 from vela.rag.loader import load_document
@@ -53,6 +55,24 @@ _DOCUMENT_ANALYSIS_PROMPT = (
     f"간결하게 작성하고 사용자가 탐색을 시작하도록 초대하며 마무리하세요. {_LANG}"
 )
 
+_WFC_INIT_PROMPT = (
+    "이 내용을 분석해 논의해야 할 주제 공간을 JSON으로 생성하세요.\n"
+    "형식 — JSON 배열만 반환, 설명 없이:\n"
+    '[{"topic":"주제명","description":"한줄설명","entropy":0.0~1.0,"related":["관련주제"]},...]\n'
+    "entropy가 낮을수록 먼저 논의할 중요한 주제. 4~7개 항목. 한국어로."
+)
+
+
+def _parse_json_list(text: str) -> list[dict]:
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group())
+        return [c for c in data if isinstance(c, dict) and c.get("topic")]
+    except (json.JSONDecodeError, TypeError):
+        return []
+
 
 def _parse_list(text: str, max_items: int = 5) -> list[str]:
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
@@ -71,8 +91,9 @@ class VelaAgent:
         self._embedder = Embedder()
         self._state_detector = StateDetector(self._embedder)
         self._retriever = Retriever()
-        self._agenda: list[str] = []
-        self._agenda_index: int = 0
+        self._wfc = ConversationWFC()
+
+    # ── 문서 ─────────────────────────────────────────────────────────────
 
     def load_document(self, path: str) -> int:
         chunks = load_document(path)
@@ -80,7 +101,7 @@ class VelaAgent:
         return len(chunks)
 
     def analyze_document(self) -> str:
-        """문서 로드 직후 호출 — 사용자 입력 없이 에이전트가 먼저 분석 메시지를 생성한다."""
+        """문서 로드 직후 호출 — 에이전트가 먼저 분석 메시지를 생성하고 WFC를 초기화한다."""
         sample = self._retriever.search("주요 주제 개요 요약", top_k=3)
         if not sample:
             return ""
@@ -88,65 +109,85 @@ class VelaAgent:
         messages = [{"role": "user", "content": f"문서 내용:\n{preview}"}]
         response = self._llm.chat(messages, system=_DOCUMENT_ANALYSIS_PROMPT)
         self._context.add("assistant", response)
+        self._init_wfc_from_text(preview)
         return response
 
-    def generate_agenda(self) -> list[str]:
-        """문서 기반 논의 계획(Agenda) 자동 생성."""
-        sample = self._retriever.search("주요 주제 요구사항 개요", top_k=5)
-        if not sample:
+    # ── WFC ──────────────────────────────────────────────────────────────
+
+    def _init_wfc_from_text(self, context: str) -> None:
+        """주어진 텍스트를 기반으로 WFC 셀 공간을 초기화한다."""
+        messages = [{"role": "user", "content": context}]
+        response = self._llm.chat(messages, system=_WFC_INIT_PROMPT)
+        cells = _parse_json_list(response)
+        if cells:
+            self._wfc.initialize(cells)
+
+    def _init_wfc(self) -> None:
+        """대화 맥락을 기반으로 WFC를 초기화 (문서 없을 때)."""
+        context = " ".join(self._context.get_user_turns()[-3:])
+        if context.strip():
+            self._init_wfc_from_text(context)
+
+    def _detect_discussed_cells(self, text: str) -> list[str]:
+        """임베딩 유사도로 텍스트에서 논의된 셀을 감지."""
+        candidates = [c for c in self._wfc.get_all() if c.state == CellState.SUPERPOSITION]
+        if not candidates:
             return []
-        preview = "\n\n".join(sample)
-        system = (
-            "이 문서에서 논의해야 할 3~5개의 핵심 항목을 추출하세요. "
-            "각 항목은 구체적인 주제나 해결해야 할 질문이어야 합니다. "
-            "번호 목록으로만 반환하세요. 항목당 한 줄. 추가 설명 없이. 한국어로 작성."
-        )
-        messages = [{"role": "user", "content": f"문서:\n{preview}"}]
-        response = self._llm.chat(messages, system=system)
-        self._agenda = _parse_list(response, max_items=5)
-        self._agenda_index = 0
-        return self._agenda
+        all_texts = [text] + [f"{c.topic}: {c.description}" for c in candidates]
+        embeddings = self._embedder.embed(all_texts)
+        text_emb = embeddings[0]
+        return [
+            candidates[i].topic
+            for i, cell_emb in enumerate(embeddings[1:])
+            if Embedder.cosine_similarity(text_emb, cell_emb) > 0.55
+        ]
 
-    def has_agenda(self) -> bool:
-        return bool(self._agenda) and self._agenda_index < len(self._agenda)
-
-    def get_agenda(self) -> list[str]:
-        return self._agenda
-
-    def get_agenda_index(self) -> int:
-        return self._agenda_index
-
-    def advance_agenda(self) -> str | None:
-        """현재 agenda 항목으로 대화를 이끈다. 항목 소진 시 None 반환."""
-        if not self.has_agenda():
+    def wfc_proactive(self) -> str | None:
+        """WFC 기반 능동 발화 — entropy 가장 낮은 셀을 꺼낸다."""
+        next_cell = self._wfc.get_next()
+        if not next_cell:
             return None
-        item = self._agenda[self._agenda_index]
-        self._agenda_index += 1
-        remaining = len(self._agenda) - self._agenda_index
-        suffix = f"(남은 주제 {remaining}개)" if remaining > 0 else "(마지막 주제입니다)"
+        self._wfc.collapse(next_cell.topic)
         system = (
-            f"지금 논의할 주제: '{item}' {suffix}\n"
-            f"이 주제에 대해 자연스럽게 대화를 시작하세요. "
-            f"사용자가 깊이 탐색할 수 있도록 구체적인 질문을 던지세요. {_LANG}"
+            f"지금 '{next_cell.topic}'({next_cell.description})에 대해 "
+            f"자연스럽게 먼저 꺼내세요. "
+            f"사용자가 묻기 전에 능동적으로 이 주제를 제기하세요. "
+            f"1-2문장으로 간결하게. {_LANG}"
         )
         response = self._llm.chat(self._context.to_messages(), system=system)
         self._context.add("assistant", response)
         return response
+
+    def get_wfc_cells(self) -> list[ConversationCell]:
+        return self._wfc.get_all()
+
+    def get_wfc_next(self) -> ConversationCell | None:
+        return self._wfc.get_next()
+
+    # ── 대화 ─────────────────────────────────────────────────────────────
 
     def chat(self, user_input: str) -> tuple[str, ConversationState]:
         self._context.add("user", user_input)
         rag_results = self._retriever.search(user_input)
         state = self._state_detector.detect(self._context.get_user_turns())
+
         system = _SYSTEM_PROMPTS[state]
         if rag_results:
-            context_block = "\n\n".join(rag_results)
-            system += f"\n\nRelevant context from documents:\n{context_block}"
+            system += f"\n\nRelevant context from documents:\n{chr(10).join(rag_results)}"
+
         response = self._llm.chat(self._context.to_messages(), system=system)
         self._context.add("assistant", response)
+
+        # WFC: 첫 응답 후 초기화 (문서 없을 때) + 논의된 셀 collapse
+        if not self._wfc.is_initialized():
+            self._init_wfc()
+        for topic in self._detect_discussed_cells(user_input):
+            self._wfc.collapse(topic)
+
         return response, state
 
     def proactive_nudge(self, state: ConversationState) -> str | None:
-        """LOOPING/STUCK 상태일 때 사용자 입력 없이 에이전트가 먼저 개입 메시지를 생성한다."""
+        """LOOPING/STUCK 상태일 때 에이전트가 먼저 개입 메시지를 생성한다."""
         system = _PROACTIVE_PROMPTS.get(state)
         if not system:
             return None
@@ -155,7 +196,7 @@ class VelaAgent:
         return response
 
     def suggest_questions(self) -> list[str]:
-        """다음에 물어볼 선제 질문 3개 생성."""
+        """WFC 소진 후 fallback — 선제 질문 3개 생성."""
         if not self._context.to_messages():
             return []
         system = (
@@ -168,5 +209,4 @@ class VelaAgent:
 
     def reset(self) -> None:
         self._context.clear()
-        self._agenda = []
-        self._agenda_index = 0
+        self._wfc.reset()
