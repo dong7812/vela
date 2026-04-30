@@ -142,6 +142,10 @@ def main() -> None:
             {"role": "assistant", "content": response, "state": state}
         )
 
+        if not agent.is_wfc_initialized():
+            with st.spinner("대화 공간 구성 중..."):
+                agent.init_wfc()
+
         proactive_msg = None
         proactive_tag = None
 

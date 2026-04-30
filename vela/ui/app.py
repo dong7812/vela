@@ -3,6 +3,7 @@ import streamlit as st
 from vela.agent import VelaAgent
 from vela.core.state import ConversationState
 from vela.core.wfc import CellState
+from vela.llm.claude import ClaudeLLM, _MODELS as CLAUDE_MODELS
 
 _STATE_LABELS = {
     ConversationState.EXPLORING: ("🔍 탐색 중", "blue"),
@@ -20,8 +21,21 @@ _STATE_DESCRIPTIONS = {
 
 
 @st.cache_resource
-def _get_agent() -> VelaAgent:
+def _get_agent(llm_key: str = "ollama") -> VelaAgent:
+    if llm_key.startswith("claude:"):
+        _, api_key, model = llm_key.split(":", 2)
+        return VelaAgent(llm=ClaudeLLM(api_key=api_key, model=model))
     return VelaAgent()
+
+
+def _build_llm_key() -> str:
+    llm_choice = st.session_state.get("llm_choice", "Ollama (로컬)")
+    if llm_choice == "Claude API":
+        api_key = st.session_state.get("claude_api_key", "")
+        model = st.session_state.get("claude_model", CLAUDE_MODELS[0])
+        if api_key:
+            return f"claude:{api_key}:{model}"
+    return "ollama"
 
 
 def _init_session() -> None:
@@ -39,6 +53,22 @@ def _init_session() -> None:
 
 def _render_sidebar(agent: VelaAgent) -> None:
     with st.sidebar:
+        # LLM 설정
+        st.header("LLM 설정")
+        st.selectbox(
+            "모델 선택",
+            ["Ollama (로컬)", "Claude API"],
+            key="llm_choice",
+        )
+        if st.session_state.get("llm_choice") == "Claude API":
+            st.text_input("API Key", type="password", key="claude_api_key", placeholder="sk-ant-...")
+            st.selectbox("Claude 모델", CLAUDE_MODELS, key="claude_model")
+            if st.session_state.get("claude_api_key"):
+                st.success("✅ API Key 입력됨")
+            else:
+                st.warning("API Key를 입력하세요")
+
+        st.divider()
         st.header("문서 로드")
         uploaded = st.file_uploader(
             "파일을 업로드하세요 (txt, md, pdf)",
@@ -142,7 +172,7 @@ def main() -> None:
     st.caption("AI SDK that acts before you ask — 로컬 LLM 기반 능동 대화 에이전트")
 
     _init_session()
-    agent = _get_agent()
+    agent = _get_agent(_build_llm_key())
     _render_sidebar(agent)
     _render_history()
     _render_suggestions()
@@ -173,7 +203,12 @@ def main() -> None:
         )
         st.session_state.last_state = detected_state
 
-        # 2. 능동 후속 — 우선순위: LOOPING/STUCK > WFC > 선제 질문
+        # 2. WFC 초기화 (첫 턴, 문서 없을 때)
+        if not agent.is_wfc_initialized():
+            with st.spinner("대화 공간 구성 중..."):
+                agent.init_wfc()
+
+        # 3. 능동 후속 — 우선순위: LOOPING/STUCK > WFC > 선제 질문
         proactive_msg = None
         proactive_tag = None
 
