@@ -1,6 +1,7 @@
 import streamlit as st
 
 from vela.agent import VelaAgent
+from vela.core.prima import InitiativeDecision, InitiativeType
 from vela.core.state import ConversationState
 from vela.core.wfc import CellState
 from vela.llm.claude import ClaudeLLM, _MODELS as CLAUDE_MODELS
@@ -8,15 +9,26 @@ from vela.llm.claude import ClaudeLLM, _MODELS as CLAUDE_MODELS
 _STATE_LABELS = {
     ConversationState.EXPLORING: ("🔍 탐색 중", "blue"),
     ConversationState.DEEPENING: ("🔎 심화 중", "green"),
-    ConversationState.LOOPING: ("🔄 반복 감지됨", "orange"),
-    ConversationState.STUCK: ("⛔ 막힘 감지됨", "red"),
+    ConversationState.LOOPING:   ("🔄 반복 감지됨", "orange"),
+    ConversationState.STUCK:     ("⛔ 막힘 감지됨", "red"),
 }
 
 _STATE_DESCRIPTIONS = {
     ConversationState.EXPLORING: "새로운 주제를 탐색하고 있습니다.",
     ConversationState.DEEPENING: "주제가 깊어지고 있습니다.",
-    ConversationState.LOOPING: "Vela가 새로운 방향을 제안합니다.",
-    ConversationState.STUCK: "Vela가 즉시 대안을 제시합니다.",
+    ConversationState.LOOPING:   "Vela가 새로운 방향을 제안합니다.",
+    ConversationState.STUCK:     "Vela가 즉시 대안을 제시합니다.",
+}
+
+_INITIATIVE_LABELS = {
+    InitiativeType.QUESTION:        ("❓ 탐색 질문",    "blue"),
+    InitiativeType.RESTATEMENT:     ("🔁 이해 재확인",  "blue"),
+    InitiativeType.REFLECTION:      ("🪞 상황 반영",    "orange"),
+    InitiativeType.INFORMATION:     ("📌 정보 제공",    "violet"),
+    InitiativeType.AFFIRMATION:     ("✅ 확신 강화",    "green"),
+    InitiativeType.SUGGESTION:      ("💡 구체 제안",    "green"),
+    InitiativeType.REFRAME:         ("🔀 문제 재정의",  "red"),
+    InitiativeType.SELF_DISCLOSURE: ("🎯 AI 관점 공유", "gray"),
 }
 
 
@@ -40,11 +52,12 @@ def _build_llm_key() -> str:
 
 def _init_session() -> None:
     defaults = {
-        "messages": [],
-        "last_state": None,
-        "analyzed_files": set(),
+        "messages":        [],
+        "last_state":      None,
+        "last_decision":   None,
+        "analyzed_files":  set(),
         "last_suggestions": [],
-        "suggestion_key": 0,
+        "suggestion_key":  0,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -131,10 +144,31 @@ def _render_sidebar(agent: VelaAgent) -> None:
         else:
             st.caption("아직 대화가 시작되지 않았습니다.")
 
+        # PRIMA 점수 표시
+        decision: InitiativeDecision | None = st.session_state.last_decision
+        if decision:
+            st.divider()
+            st.header("PRIMA 신호")
+            score_pct = int(decision.score * 100)
+            bar_color = "red" if decision.should_intervene else "gray"
+            st.markdown(f":{bar_color}[**개입 점수: {score_pct}%**]")
+            s = decision.signals
+            st.caption(
+                f"정체 {s.stagnation:.2f} · "
+                f"참여↓ {s.engagement_decay:.2f} · "
+                f"혼란 {s.confusion:.2f} · "
+                f"공백 {s.coverage_gap:.2f} · "
+                f"부채 {s.initiative_debt:.2f}"
+            )
+            if decision.should_intervene and decision.initiative_type:
+                i_label, i_color = _INITIATIVE_LABELS[decision.initiative_type]
+                st.markdown(f":{i_color}[**→ {i_label}**]")
+
         if st.button("대화 초기화"):
             agent.reset()
             st.session_state.messages = []
             st.session_state.last_state = None
+            st.session_state.last_decision = None
             st.session_state.analyzed_files = set()
             st.session_state.last_suggestions = []
             st.session_state.suggestion_key = 0
@@ -186,11 +220,11 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # 1. 응답
+        # 1. 응답 생성 + PRIMA 판단
         with st.chat_message("assistant"):
             with st.spinner("생각 중..."):
                 try:
-                    response, detected_state = agent.chat(user_input)
+                    response, detected_state, decision = agent.chat(user_input)
                 except Exception as e:
                     st.error(f"오류가 발생했습니다: {e}\nOllama가 실행 중인지 확인해 주세요.")
                     st.stop()
@@ -202,26 +236,31 @@ def main() -> None:
             {"role": "assistant", "content": response, "state": detected_state}
         )
         st.session_state.last_state = detected_state
+        st.session_state.last_decision = decision
 
         # 2. WFC 초기화 (첫 턴, 문서 없을 때)
         if not agent.is_wfc_initialized():
             with st.spinner("대화 공간 구성 중..."):
                 agent.init_wfc()
 
-        # 3. 능동 후속 — 우선순위: LOOPING/STUCK > WFC > 선제 질문
+        # 3. PRIMA 능동 개입 — 점수가 임계값을 넘을 때만 개입
         proactive_msg = None
         proactive_tag = None
 
-        if detected_state in (ConversationState.LOOPING, ConversationState.STUCK):
-            with st.spinner("Vela 개입 중..."):
-                proactive_msg = agent.proactive_nudge(detected_state)
-            proactive_tag = f":{color}[{label}] — 🎯 능동 개입"
+        if decision.should_intervene:
+            i_type = decision.initiative_type
 
-        elif agent.get_wfc_next():
-            with st.spinner("다음 주제 꺼내는 중..."):
-                proactive_msg = agent.wfc_proactive()
-            next_cell = agent.get_wfc_next()
-            proactive_tag = f"🌊 WFC — {next_cell.topic if next_cell else '대화 공간 탐색'}"
+            # INFORMATION + WFC 다음 셀이 있으면 WFC 주제 특화 발화 우선 사용
+            if i_type == InitiativeType.INFORMATION and agent.get_wfc_next():
+                with st.spinner("다음 주제 꺼내는 중..."):
+                    proactive_msg = agent.wfc_proactive()
+                next_cell = agent.get_wfc_next()
+                proactive_tag = f"🌊 WFC · {next_cell.topic if next_cell else '대화 공간 탐색'}"
+            else:
+                i_label, i_color = _INITIATIVE_LABELS[i_type]
+                with st.spinner(f"Vela 개입 중... ({i_label})"):
+                    proactive_msg = agent.prima_intervene(i_type)
+                proactive_tag = f":{i_color}[{i_label}] — PRIMA {int(decision.score * 100)}%"
 
         if proactive_msg:
             with st.chat_message("assistant"):
@@ -232,6 +271,7 @@ def main() -> None:
                  "state": detected_state, "tag": proactive_tag}
             )
         else:
+            # PRIMA가 개입하지 않기로 결정 → 선제 질문 제안
             with st.spinner("질문 제안 중..."):
                 st.session_state.last_suggestions = agent.suggest_questions()
             st.session_state.suggestion_key += 1
