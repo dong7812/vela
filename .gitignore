@@ -8,6 +8,7 @@ build/
 
 # Vela 로컬 데이터
 .vela_db/
+.vela_feedback.jsonl
 
 # 모델 캐시 (sentence-transformers, huggingface)
 .cache/

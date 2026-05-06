@@ -1,3 +1,5 @@
+import uuid
+
 import streamlit as st
 
 from vela.agent import VelaAgent
@@ -52,12 +54,16 @@ def _build_llm_key() -> str:
 
 def _init_session() -> None:
     defaults = {
-        "messages":        [],
-        "last_state":      None,
-        "last_decision":   None,
-        "analyzed_files":  set(),
-        "last_suggestions": [],
-        "suggestion_key":  0,
+        "messages":          [],
+        "last_state":        None,
+        "last_decision":     None,
+        "analyzed_files":    set(),
+        "last_suggestions":  [],
+        "suggestion_key":    0,
+        "session_id":        str(uuid.uuid4()),
+        "turn":              0,
+        # 직전 PRIMA 개입 정보 — 다음 턴에서 outcome 측정용
+        "pending_feedback":  None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -66,7 +72,6 @@ def _init_session() -> None:
 
 def _render_sidebar(agent: VelaAgent) -> None:
     with st.sidebar:
-        # LLM 설정
         st.header("LLM 설정")
         st.selectbox(
             "모델 선택",
@@ -89,7 +94,6 @@ def _render_sidebar(agent: VelaAgent) -> None:
         )
         if uploaded is not None:
             import tempfile, os
-
             file_key = f"{uploaded.name}_{uploaded.size}"
             if file_key not in st.session_state.analyzed_files:
                 suffix = os.path.splitext(uploaded.name)[1]
@@ -120,12 +124,7 @@ def _render_sidebar(agent: VelaAgent) -> None:
             next_cell = agent.get_wfc_next()
             n_collapsed = sum(1 for c in cells if c.state == CellState.COLLAPSED)
             st.header(f"대화 공간 ({n_collapsed}/{len(cells)})")
-
-            sorted_cells = sorted(
-                cells,
-                key=lambda c: (c.state == CellState.COLLAPSED, c.entropy),
-            )
-            for cell in sorted_cells:
+            for cell in sorted(cells, key=lambda c: (c.state == CellState.COLLAPSED, c.entropy)):
                 if cell.state == CellState.COLLAPSED:
                     st.markdown(f"✅ ~~{cell.topic}~~")
                 elif next_cell and cell.topic == next_cell.topic:
@@ -144,7 +143,7 @@ def _render_sidebar(agent: VelaAgent) -> None:
         else:
             st.caption("아직 대화가 시작되지 않았습니다.")
 
-        # PRIMA 점수 표시
+        # PRIMA 신호
         decision: InitiativeDecision | None = st.session_state.last_decision
         if decision:
             st.divider()
@@ -164,6 +163,9 @@ def _render_sidebar(agent: VelaAgent) -> None:
                 i_label, i_color = _INITIATIVE_LABELS[decision.initiative_type]
                 st.markdown(f":{i_color}[**→ {i_label}**]")
 
+        # 피드백 통계
+        _render_feedback_stats(agent)
+
         if st.button("대화 초기화"):
             agent.reset()
             st.session_state.messages = []
@@ -172,18 +174,58 @@ def _render_sidebar(agent: VelaAgent) -> None:
             st.session_state.analyzed_files = set()
             st.session_state.last_suggestions = []
             st.session_state.suggestion_key = 0
+            st.session_state.pending_feedback = None
             st.rerun()
 
 
-def _render_history() -> None:
+def _render_feedback_stats(agent: VelaAgent) -> None:
+    total = agent.feedback.total_interventions()
+    if total == 0:
+        return
+    st.divider()
+    st.header(f"피드백 ({total}회 개입)")
+    summary = agent.feedback.get_summary()
+    for i_type, stat in sorted(summary.items(), key=lambda x: -(x[1]["count"])):
+        count = stat["count"]
+        sr = stat["success_rate"]
+        lr = stat["avg_length_ratio"]
+        label_text = f"{i_type} ×{count}"
+        if sr is not None:
+            bar = "🟢" if sr >= 0.6 else ("🟡" if sr >= 0.4 else "🔴")
+            st.caption(f"{bar} {label_text}  성공률 {int(sr*100)}%  길이비 {lr:.2f}")
+        else:
+            st.caption(f"⬜ {label_text}  (결과 대기 중)")
+
+
+def _render_history(agent: VelaAgent) -> None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if tag := msg.get("tag"):
+            tag = msg.get("tag")
+            state = msg.get("state")
+            fb_key = msg.get("feedback_key")
+
+            if tag:
                 st.caption(tag)
-            elif state := msg.get("state"):
+            elif state:
                 label, color = _STATE_LABELS[state]
                 st.caption(f":{color}[{label}]")
+
+            # 👍/👎 버튼 — PRIMA 능동 발화에만 표시
+            if fb_key and fb_key not in st.session_state.get("rated_keys", set()):
+                c1, c2, _ = st.columns([1, 1, 8])
+                if c1.button("👍", key=f"up_{fb_key}"):
+                    agent.feedback.record_explicit_rating(
+                        *fb_key.split("|"), rating=1
+                    )
+                    st.session_state.setdefault("rated_keys", set()).add(fb_key)
+                    st.rerun()
+                if c2.button("👎", key=f"dn_{fb_key}"):
+                    agent.feedback.record_explicit_rating(
+                        *fb_key.split("|"), rating=-1
+                    )
+                    st.session_state.setdefault("rated_keys", set()).add(fb_key)
+                    st.rerun()
 
 
 def _render_suggestions() -> None:
@@ -208,75 +250,121 @@ def main() -> None:
     _init_session()
     agent = _get_agent(_build_llm_key())
     _render_sidebar(agent)
-    _render_history()
+    _render_history(agent)
     _render_suggestions()
 
     pending = st.session_state.pop("pending_input", None)
     user_input = pending or st.chat_input("메시지를 입력하세요...")
 
-    if user_input:
-        st.session_state.last_suggestions = []
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
+    if not user_input:
+        return
 
-        # 1. 스트리밍 응답
-        try:
-            messages, system, detected_state = agent.prepare_chat(user_input)
-        except Exception as e:
-            st.error(f"오류가 발생했습니다: {e}\nOllama가 실행 중인지 확인해 주세요.")
-            st.stop()
+    st.session_state.turn += 1
+    turn = st.session_state.turn
+    session_id = st.session_state.session_id
+    msg_len = len(user_input.split())
 
-        with st.chat_message("assistant"):
-            response = st.write_stream(agent._llm.chat_stream(messages, system))
-            label, color = _STATE_LABELS[detected_state]
-            st.caption(f":{color}[{label}]")
-
-        decision = agent.finalize_chat(response, detected_state)
-
-        st.session_state.messages.append(
-            {"role": "assistant", "content": response, "state": detected_state}
+    # ── 암묵적 outcome 측정 — 직전 PRIMA 개입 결과를 지금 턴에서 자동 수집 ──
+    pf = st.session_state.pending_feedback
+    if pf:
+        agent.feedback.record_outcome(
+            session_id=session_id,
+            turn=pf["turn"],
+            msg_len_before=pf["msg_len_before"],
+            msg_len_after=msg_len,
+            state_before=pf["state_before"],
+            state_after=st.session_state.last_state.value if st.session_state.last_state else "EXPLORING",
         )
-        st.session_state.last_state = detected_state
-        st.session_state.last_decision = decision
+        st.session_state.pending_feedback = None
 
-        # 2. WFC 초기화 (첫 턴, 문서 없을 때)
-        if not agent.is_wfc_initialized():
-            with st.spinner("대화 공간 구성 중..."):
-                agent.init_wfc()
+    st.session_state.last_suggestions = []
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-        # 3. PRIMA 능동 개입 — 점수가 임계값을 넘을 때만 개입
-        proactive_tag = None
-        proactive_text = None
+    # 1. 스트리밍 응답
+    try:
+        messages, system, detected_state = agent.prepare_chat(user_input)
+    except Exception as e:
+        st.error(f"오류가 발생했습니다: {e}\nOllama가 실행 중인지 확인해 주세요.")
+        st.stop()
 
-        if decision.should_intervene:
-            i_type = decision.initiative_type
+    with st.chat_message("assistant"):
+        response = st.write_stream(agent._llm.chat_stream(messages, system))
+        label, color = _STATE_LABELS[detected_state]
+        st.caption(f":{color}[{label}]")
 
-            # INFORMATION + WFC 다음 셀 → WFC 주제 특화 발화 우선
-            if i_type == InitiativeType.INFORMATION and agent.get_wfc_next():
-                next_cell = agent.get_wfc_next()
-                proactive_tag = f"🌊 WFC · {next_cell.topic if next_cell else '대화 공간 탐색'}"
-                with st.chat_message("assistant"):
-                    proactive_text = st.write_stream(agent.wfc_proactive_stream())
-                    st.caption(proactive_tag)
-            else:
-                i_label, i_color = _INITIATIVE_LABELS[i_type]
-                proactive_tag = f":{i_color}[{i_label}] — PRIMA {int(decision.score * 100)}%"
-                with st.chat_message("assistant"):
-                    proactive_text = st.write_stream(agent.prima_intervene_stream(i_type))
-                    st.caption(proactive_tag)
+    decision = agent.finalize_chat(response, detected_state)
 
-        if proactive_text:
-            st.session_state.messages.append(
-                {"role": "assistant", "content": proactive_text,
-                 "state": detected_state, "tag": proactive_tag}
-            )
+    st.session_state.messages.append(
+        {"role": "assistant", "content": response, "state": detected_state}
+    )
+    st.session_state.last_state = detected_state
+    st.session_state.last_decision = decision
+
+    # 2. WFC 초기화 (첫 턴, 문서 없을 때)
+    if not agent.is_wfc_initialized():
+        with st.spinner("대화 공간 구성 중..."):
+            agent.init_wfc()
+
+    # 3. PRIMA 능동 개입
+    proactive_tag  = None
+    proactive_text = None
+    fb_key         = None
+
+    if decision.should_intervene:
+        i_type = decision.initiative_type
+        fb_key = f"{session_id}|{turn}"
+
+        if i_type == InitiativeType.INFORMATION and agent.get_wfc_next():
+            next_cell = agent.get_wfc_next()
+            proactive_tag = f"🌊 WFC · {next_cell.topic if next_cell else '대화 공간 탐색'}"
+            with st.chat_message("assistant"):
+                proactive_text = st.write_stream(agent.wfc_proactive_stream())
+                st.caption(proactive_tag)
         else:
-            # PRIMA 미개입 → 선제 질문 제안
-            with st.spinner("질문 제안 중..."):
-                st.session_state.last_suggestions = agent.suggest_questions()
-            st.session_state.suggestion_key += 1
-            st.rerun()
+            i_label, i_color = _INITIATIVE_LABELS[i_type]
+            proactive_tag = f":{i_color}[{i_label}] — PRIMA {int(decision.score * 100)}%"
+            with st.chat_message("assistant"):
+                proactive_text = st.write_stream(agent.prima_intervene_stream(i_type))
+                st.caption(proactive_tag)
+
+        # 개입 기록 + 다음 턴에서 outcome 측정하기 위한 pending 저장
+        if proactive_text and decision.initiative_type:
+            agent.feedback.record_intervention(
+                session_id=session_id,
+                turn=turn,
+                initiative_type=decision.initiative_type.value,
+                prima_score=decision.score,
+                state_before=detected_state.value,
+                msg_len_before=msg_len,
+                signals={
+                    "stagnation":       decision.signals.stagnation,
+                    "engagement_decay": decision.signals.engagement_decay,
+                    "confusion":        decision.signals.confusion,
+                    "coverage_gap":     decision.signals.coverage_gap,
+                    "initiative_debt":  decision.signals.initiative_debt,
+                },
+            )
+            st.session_state.pending_feedback = {
+                "turn":          turn,
+                "state_before":  detected_state.value,
+                "msg_len_before": msg_len,
+            }
+
+    if proactive_text:
+        st.session_state.messages.append({
+            "role":         "assistant",
+            "content":      proactive_text,
+            "state":        detected_state,
+            "tag":          proactive_tag,
+            "feedback_key": fb_key,   # 👍/👎 버튼 렌더링용 키
+        })
+    else:
+        with st.spinner("질문 제안 중..."):
+            st.session_state.last_suggestions = agent.suggest_questions()
+        st.session_state.suggestion_key += 1
+        st.rerun()
 
 
 main()
