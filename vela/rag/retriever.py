@@ -42,7 +42,7 @@ class Retriever:
                 metadatas=[{"source": source} for _ in new_docs],
             )
 
-    def search(self, query: str, top_k: int = TOP_K, distance_threshold: float = 0.5) -> list[str]:
+    def search(self, query: str, top_k: int = TOP_K) -> list[str]:
         count = self._collection.count()
         if count == 0:
             return []
@@ -51,15 +51,9 @@ class Retriever:
         results = self._collection.query(
             query_embeddings=[query_emb],
             n_results=min(top_k, count),
-            include=["documents", "distances"],
+            include=["documents"],
         )
         if not results["documents"]:
             return []
 
-        # cosine space: distance = 1 - cosine_similarity (0=완전일치, 2=정반대)
-        # threshold 0.5 → cosine_similarity ≥ 0.5
-        return [
-            doc
-            for doc, dist in zip(results["documents"][0], results["distances"][0])
-            if dist < distance_threshold
-        ]
+        return results["documents"][0]
