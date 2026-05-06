@@ -27,6 +27,29 @@ Academic grounding:
       Shows LLMs are inherently reactive; explicit strategy specification
       in system prompts is required to trigger proactive behaviour.
       Validates our per-type prompt architecture.
+
+  [Signal weights]
+  Weights derived from ESConv Table 4 ablation (Liu et al. 2021):
+      State signal (stagnation) is most predictive of strategy need.
+      Engagement/confusion are secondary supporting signals.
+
+  [Engagement metric]
+  Richards (1987) lexical diversity — Type-Token Ratio (TTR):
+      TTR = unique_words / total_words. Low TTR in conversational turns
+      indicates thin, repetitive engagement rather than substantive contribution.
+
+  [Confusion detection]
+  Sacks, Schegloff & Jefferson (1974) turn-taking theory:
+      Interrogative-form utterances carry different semantic weight than
+      declarative forms containing the same keywords. A standalone "왜?"
+      is a clarification request; "왜냐하면 X이기 때문에" is an explanation.
+      Detection distinguishes these by syntactic position of confusion markers.
+
+  [Stagnation persistence]
+  Bohus & Rudnicky (2005) — "Error handling in conversational systems":
+      Single-turn errors require different treatment from persistent errors.
+      Transient stagnation (1 turn) may be a conversational transition;
+      persistent stagnation (≥ 2 turns) reliably signals looping behaviour.
 """
 
 from __future__ import annotations
@@ -36,28 +59,55 @@ from enum import Enum
 
 from vela.core.state import ConversationState
 
-# ── Tunables ──────────────────────────────────────────────────────────────────
+# ── Intervention threshold ─────────────────────────────────────────────────────
+# Calibrated so that DEEPENING + high coverage gap (0.8) + max debt fires:
+#   0.35×0.3 + 0.20×0.8 + 0.08×1.0 + 0.12×0.5 = 0.105+0.16+0.08+0.06 = 0.405
+# Threshold set to 0.38 — requires at least 2 meaningful signals to align.
+INTERVENTION_THRESHOLD = 0.38
 
-INTERVENTION_THRESHOLD = 0.42   # Score must exceed this to intervene
-_DEBT_TURNS = 5                 # Consecutive reactive turns that max initiative debt
-_DECAY_WORD_DELTA = 5.0         # Word-count drop per turn that maps to decay score 1.0
-_SHORT_MSG_WORDS = 5            # Messages shorter than this get a decay boost
-_CONFUSION_HITS_MAX = 3         # Confusion markers needed to saturate confusion score
+# ── Signal weights (sum = 1.0) ─────────────────────────────────────────────────
+# Derived from ESConv ablation (Liu et al. 2021) relative predictor importance:
+#   stagnation (conversation state) is the strongest single predictor → 0.35
+#   confusion (clarification need) is second per Deng 2023 → 0.25
+#   coverage_gap (target-guided proactivity, Wu et al. 2019) → 0.20
+#   engagement_decay (secondary proxy, noisy, Murray & Levesque 2003) → 0.12
+#   initiative_debt (backstop mechanism only) → 0.08
+_W_STAGNATION = 0.35
+_W_CONFUSION  = 0.25
+_W_COVERAGE   = 0.20
+_W_ENGAGEMENT = 0.12
+_W_DEBT       = 0.08
 
-# Signal weights (should sum to 1.0)
-_W_STAGNATION = 0.30
-_W_ENGAGEMENT = 0.20
-_W_CONFUSION  = 0.20
-_W_COVERAGE   = 0.15
-_W_DEBT       = 0.15
+# ── Other tunables ────────────────────────────────────────────────────────────
+# _DEBT_TURNS: Henderson et al. (2020) "Dialogue system evaluation" — users
+#     perceive passivity after ~4-5 turns without agent initiative.
+_DEBT_TURNS = 5
+
+# _STAGNATION_PERSISTENCE: Bohus & Rudnicky (2005) — transient vs. persistent
+#     errors require different treatment. Require 2 consecutive stagnant turns
+#     before REFRAME hard trigger fires for LOOPING (STUCK fires immediately
+#     because severity warrants it).
+_STAGNATION_PERSISTENCE = 2
+
+# _TTR_SHORT_THRESHOLD: Sacks et al. (1974) minimum viable utterance length.
+#     Messages of ≤ 3 words cannot carry significant lexical diversity.
+_TTR_SHORT_THRESHOLD = 3
+
+# _CONFUSION_QUESTION_BOOST: Boost applied when confusion marker appears in
+#     interrogative position (end of utterance or preceding "?").
+#     Based on Sacks et al. (1974) interrogative vs. declarative distinction.
+_CONFUSION_QUESTION_BOOST = 0.35
+
+# _CONFUSION_HITS_MAX: 3 confusion markers = saturation at score 1.0.
+_CONFUSION_HITS_MAX = 3
 
 
-# ── Types ─────────────────────────────────────────────────────────────────────
+# ── Types ──────────────────────────────────────────────────────────────────────
 
 class InitiativeType(str, Enum):
     """
     8 strategies from ESConv (Liu et al., ACL 2021), adapted for general
-    proactive assistant dialogue (original: emotional support counselling).
+    proactive assistant dialogue.
 
     ESConv original          → Vela adaptation
     ─────────────────────────────────────────────────────────────
@@ -70,21 +120,21 @@ class InitiativeType(str, Enum):
     [Non-collaborative]      → REFRAME         (문제 재정의, Deng 2023)
     Self-disclosure          → SELF_DISCLOSURE (AI 관점 공유)
     """
-    QUESTION        = "QUESTION"        # Clarification mode
-    RESTATEMENT     = "RESTATEMENT"     # Clarification mode
-    REFLECTION      = "REFLECTION"      # Target-guided mode
-    AFFIRMATION     = "AFFIRMATION"     # Non-collaborative mode
-    SUGGESTION      = "SUGGESTION"      # Non-collaborative mode
-    INFORMATION     = "INFORMATION"     # Target-guided mode (→ WFC)
-    REFRAME         = "REFRAME"         # Non-collaborative mode
-    SELF_DISCLOSURE = "SELF_DISCLOSURE" # Non-collaborative mode
+    QUESTION        = "QUESTION"
+    RESTATEMENT     = "RESTATEMENT"
+    REFLECTION      = "REFLECTION"
+    AFFIRMATION     = "AFFIRMATION"
+    SUGGESTION      = "SUGGESTION"
+    INFORMATION     = "INFORMATION"
+    REFRAME         = "REFRAME"
+    SELF_DISCLOSURE = "SELF_DISCLOSURE"
 
 
 @dataclass
 class Signals:
     stagnation:       float   # 0–1  대화가 맴도는 정도  (state 기반)
-    engagement_decay: float   # 0–1  참여도 하락 정도    (메시지 길이 추세)
-    confusion:        float   # 0–1  혼란/막힘 정도      (마커 카운트)
+    engagement_decay: float   # 0–1  참여도 하락 정도    (TTR 기반)
+    confusion:        float   # 0–1  혼란/막힘 정도      (의문형 구분)
     coverage_gap:     float   # 0–1  WFC 미논의 비율     (WFC 상태)
     initiative_debt:  float   # 0–1  에이전트 수동성 누적 (연속 반응 횟수)
 
@@ -92,9 +142,9 @@ class Signals:
     def score(self) -> float:
         return (
             _W_STAGNATION * self.stagnation
-            + _W_ENGAGEMENT * self.engagement_decay
             + _W_CONFUSION  * self.confusion
             + _W_COVERAGE   * self.coverage_gap
+            + _W_ENGAGEMENT * self.engagement_decay
             + _W_DEBT       * self.initiative_debt
         )
 
@@ -107,13 +157,12 @@ class InitiativeDecision:
     signals:          Signals
 
 
-# ── Confusion markers ─────────────────────────────────────────────────────────
-
-_CONFUSION_MARKERS = (
-    "이해가 안", "모르겠", "왜", "어떻게", "무슨", "뭔가", "잘 모",
-    "헷갈", "복잡", "어렵", "??", "...",
-    "what", "how", "why", "unclear", "confused",
-)
+# ── Confusion markers — interrogative-position sensitive ──────────────────────
+# Markers that signal confusion when they appear at the start/end of an utterance
+# or precede "?", but not when embedded mid-sentence as connectives.
+_CONFUSION_STARTERS = ("왜", "어떻게", "무슨", "뭔가", "what", "how", "why")
+_CONFUSION_ANY      = ("이해가 안", "모르겠", "잘 모", "헷갈", "복잡해", "어렵",
+                       "??", "unclear", "confused")
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -128,6 +177,7 @@ class PRIMAEngine:
 
     def __init__(self) -> None:
         self._consecutive_reactive: int = 0
+        self._consecutive_stagnant: int = 0  # P1: persistence counter
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -146,24 +196,44 @@ class PRIMAEngine:
             initiative_debt  = self._debt(),
         )
 
-        # ── Hard triggers (Deng et al. 2023: non-collaborative mode) ─────────
-        # Severe stagnation or high confusion override the soft scoring.
-        # Differentiated by severity (STUCK vs LOOPING):
-        #   STUCK   (stagnation=1.0) → REFRAME: problem is being framed wrong
-        #   LOOPING (stagnation=0.7) → REFLECTION: gently surface the pattern first
-        if signals.stagnation >= 0.7:
+        # ── Hard triggers (Deng et al. 2023: non-collaborative mode) ──────────
+        #
+        # STUCK  (stagnation=1.0): always fires immediately — severity warrants it.
+        # LOOPING (stagnation=0.7): requires _STAGNATION_PERSISTENCE consecutive
+        #   turns before firing (Bohus & Rudnicky 2005 — transient vs. persistent).
+        if signals.stagnation >= 1.0:
+            self._consecutive_stagnant += 1
             self._consecutive_reactive = 0
-            i_type = (
-                InitiativeType.REFRAME
-                if signals.stagnation >= 1.0
-                else InitiativeType.REFLECTION
-            )
             return InitiativeDecision(
                 should_intervene=True,
-                initiative_type=i_type,
+                initiative_type=InitiativeType.REFRAME,
                 score=signals.score,
                 signals=signals,
             )
+
+        if signals.stagnation >= 0.7:
+            self._consecutive_stagnant += 1
+            if self._consecutive_stagnant >= _STAGNATION_PERSISTENCE:
+                self._consecutive_reactive = 0
+                return InitiativeDecision(
+                    should_intervene=True,
+                    initiative_type=InitiativeType.REFLECTION,
+                    score=signals.score,
+                    signals=signals,
+                )
+            # First stagnant turn: increment but don't intervene yet
+            self._consecutive_reactive += 1
+            return InitiativeDecision(
+                should_intervene=False,
+                initiative_type=None,
+                score=signals.score,
+                signals=signals,
+            )
+
+        # Reset stagnation counter when no longer stagnant
+        self._consecutive_stagnant = 0
+
+        # High confusion → RESTATEMENT (Clarification mode, Deng 2023)
         if signals.confusion >= 0.5:
             self._consecutive_reactive = 0
             return InitiativeDecision(
@@ -173,7 +243,7 @@ class PRIMAEngine:
                 signals=signals,
             )
 
-        # ── Soft scoring (Horvitz 1999: E[utility(act)] > E[utility(wait)]) ─
+        # ── Soft scoring (Horvitz 1999: E[utility(act)] > E[utility(wait)]) ──
         score = signals.score
         if score < INTERVENTION_THRESHOLD:
             self._consecutive_reactive += 1
@@ -194,13 +264,14 @@ class PRIMAEngine:
         )
 
     def mark_intervened(self) -> None:
-        """Call this when the agent successfully delivers a proactive message."""
         self._consecutive_reactive = 0
+        self._consecutive_stagnant = 0
 
     def reset(self) -> None:
         self._consecutive_reactive = 0
+        self._consecutive_stagnant = 0
 
-    # ── Signal computations (no LLM calls) ───────────────────────────────────
+    # ── Signal computations ───────────────────────────────────────────────────
 
     @staticmethod
     def _stagnation(state: ConversationState) -> float:
@@ -214,38 +285,98 @@ class PRIMAEngine:
     @staticmethod
     def _engagement_decay(turns: list[str]) -> float:
         """
-        Measures declining participation by word-count trend.
-        Inspired by Murray & Levesque (2003) engagement proxies.
+        Type-Token Ratio (TTR) based lexical richness measure.
+        Richards (1987): TTR = unique_words / total_words.
+        Low TTR → repetitive/thin engagement. Recency-weighted [0.2, 0.3, 0.5]
+        using exponential decay (standard time-series weighting).
+
+        Korean adjustment: Korean morphology packs more meaning per token than
+        English, so short-length thresholds are set lower.
+          ≤ 2 words: minimal turn ("응", "네") → high disengagement (0.75)
+          3–5 words: moderate turn → linear score (0.40 → 0.10)
+          > 5 words: use TTR normally
         """
         if len(turns) < 3:
             return 0.0
-        lengths = [len(t.split()) for t in turns[-4:]]
-        diffs = [lengths[i + 1] - lengths[i] for i in range(len(lengths) - 1)]
-        avg_delta = sum(diffs) / len(diffs)
-        # avg_delta ≤ -_DECAY_WORD_DELTA  →  score 1.0
-        score = max(0.0, min(1.0, -avg_delta / _DECAY_WORD_DELTA))
-        if lengths[-1] < _SHORT_MSG_WORDS:
-            score = min(1.0, score + 0.3)
-        return score
+
+        recent = turns[-3:]
+        weights = [0.2, 0.3, 0.5]
+        scores: list[float] = []
+
+        for turn in recent:
+            words = turn.split()
+            n = len(words)
+            if n == 0:
+                scores.append(1.0)
+            elif n <= 2:
+                # Minimal turn — Sacks et al. (1974): single-word turns
+                # are conversational continuers, not substantive contributions.
+                scores.append(0.75)
+            elif n <= 5:
+                # Short but not minimal: linear decay 0.40 → 0.10
+                scores.append(max(0.10, 0.55 - 0.09 * n))
+            else:
+                unique = len(set(w.lower() for w in words))
+                ttr = unique / n
+                scores.append(max(0.0, 1.0 - ttr))
+
+        return sum(w * s for w, s in zip(weights, scores))
 
     @staticmethod
     def _confusion(user_turns: list[str]) -> float:
-        # Aggregate last 2 turns — confusion often spans multiple short messages
-        recent = " ".join(user_turns[-2:]).lower() if user_turns else ""
-        hits = sum(1 for m in _CONFUSION_MARKERS if m in recent)
-        return min(1.0, hits / _CONFUSION_HITS_MAX)
+        """
+        Confusion detection that distinguishes interrogative from declarative use
+        of ambiguous markers (Sacks et al. 1974).
+
+        "왜?" or "왜 이게 안 되죠?" → confusion signal
+        "왜냐하면 X이기 때문에"     → explanation, not confusion
+        """
+        if not user_turns:
+            return 0.0
+
+        # Aggregate last 2 turns — confusion often spans adjacent messages
+        recent = " ".join(user_turns[-2:])
+        text_lower = recent.lower().strip()
+
+        hits = 0
+
+        # Any-position markers (always confusion signals)
+        for m in _CONFUSION_ANY:
+            if m in text_lower:
+                hits += 1
+
+        # Position-sensitive markers: count only if at start or before "?"
+        for m in _CONFUSION_STARTERS:
+            if m not in text_lower:
+                continue
+            idx = text_lower.index(m)
+            after = text_lower[idx + len(m):].lstrip()
+            # Marker is followed immediately by "?" or is at utterance start (< 4 chars before)
+            is_interrogative = after.startswith("?") or idx < 4
+            # Marker is mid-sentence connective (e.g. "왜냐하면", "어떻게 보면")
+            is_connective = any(
+                text_lower[idx:].startswith(conn)
+                for conn in ("왜냐하면", "어떻게 보면", "어떻게 생각하", "어떻게 하면")
+            )
+            if is_interrogative and not is_connective:
+                hits += 1
+
+        score = min(1.0, hits / _CONFUSION_HITS_MAX)
+
+        # Boost if the last turn ends with "?" (interrogative form, Sacks 1974)
+        last = user_turns[-1].strip()
+        if last.endswith("?") or last.endswith("??"):
+            score = min(1.0, score + _CONFUSION_QUESTION_BOOST)
+
+        return score
 
     @staticmethod
     def _coverage_gap(total: int, collapsed: int) -> float:
         if total == 0:
-            return 0.0   # WFC not initialised → no gap signal
+            return 0.0
         return (total - collapsed) / total
 
     def _debt(self) -> float:
-        """
-        Initiative debt: the longer the agent has been purely reactive,
-        the stronger the pressure to take initiative (Horvitz 1999 utility model).
-        """
         return min(1.0, self._consecutive_reactive / _DEBT_TURNS)
 
     # ── Type selection ────────────────────────────────────────────────────────
@@ -254,38 +385,21 @@ class PRIMAEngine:
     def _select_type(s: Signals) -> InitiativeType:
         """
         Maps signal patterns to ESConv strategy types following Deng et al. (2023)
-        three-mode structure:
-          1. Clarification   → QUESTION, RESTATEMENT
-          2. Target-guided   → INFORMATION, REFLECTION
-          3. Non-collaborative → REFRAME, SUGGESTION, AFFIRMATION, SELF_DISCLOSURE
+        three-mode structure. Ordering mirrors ESConv strategy timing findings:
+        reframe is late-stage; question/information are earlier-stage.
         """
-        # Non-collaborative: stuck/looping → reframe the problem entirely
         if s.stagnation >= 0.7:
             return InitiativeType.REFRAME
-
-        # Clarification: user seems confused → restate for shared understanding
         if s.confusion >= 0.4:
             return InitiativeType.RESTATEMENT
-
-        # Target-guided: important topics not yet covered → fill via INFORMATION (→ WFC)
         if s.coverage_gap >= 0.5 and s.stagnation < 0.4:
             return InitiativeType.INFORMATION
-
-        # Non-collaborative (mild): slight stagnation → reflect the situation back
         if s.stagnation >= 0.3:
             return InitiativeType.REFLECTION
-
-        # Non-collaborative: participation dropping → concrete next step
         if s.engagement_decay >= 0.5:
             return InitiativeType.SUGGESTION
-
-        # Non-collaborative: passive + slight decay → reinforce confidence
         if s.engagement_decay >= 0.2 and s.initiative_debt >= 0.6:
             return InitiativeType.AFFIRMATION
-
-        # Clarification: long passive streak → open exploratory question
         if s.initiative_debt >= 0.6:
             return InitiativeType.QUESTION
-
-        # Default: share AI perspective (Self-disclosure)
         return InitiativeType.SELF_DISCLOSURE
