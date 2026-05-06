@@ -137,7 +137,7 @@ class VelaAgent:
         self._context = ContextWindow()
         self._embedder = Embedder()
         self._state_detector = StateDetector(self._embedder)
-        self._retriever = Retriever()
+        self._retriever = Retriever(embedder=self._embedder)
         self._wfc = ConversationWFC()
         self._prima = PRIMAEngine()
         self._last_user_input: str = ""
