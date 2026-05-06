@@ -4,6 +4,7 @@ from typing import Iterator
 
 from vela.core.context import ContextWindow
 from vela.core.embedder import Embedder
+from vela.core.feedback import FeedbackLogger
 from vela.core.prima import InitiativeDecision, InitiativeType, PRIMAEngine
 from vela.core.state import ConversationState, StateDetector
 from vela.core.wfc import CellState, ConversationCell, ConversationWFC
@@ -140,6 +141,7 @@ class VelaAgent:
         self._wfc = ConversationWFC()
         self._prima = PRIMAEngine()
         self._last_user_input: str = ""
+        self.feedback = FeedbackLogger()
 
     # ── 문서 ─────────────────────────────────────────────────────────────
 
