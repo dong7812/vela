@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Iterator
 
 from vela.core.context import ContextWindow
 from vela.core.embedder import Embedder
@@ -138,6 +139,7 @@ class VelaAgent:
         self._retriever = Retriever()
         self._wfc = ConversationWFC()
         self._prima = PRIMAEngine()
+        self._last_user_input: str = ""
 
     # ── 문서 ─────────────────────────────────────────────────────────────
 
@@ -166,6 +168,8 @@ class VelaAgent:
         cells = _parse_json_list(response)
         if cells:
             self._wfc.initialize(cells)
+            # P5: 생성된 셀 중 문맥과 무관한 셀 제거 (Reimers & Gurevych 2019)
+            self._wfc.filter_by_relevance(context, self._embedder)
 
     def _init_wfc(self) -> None:
         context = " ".join(self._context.get_user_turns()[-3:])
@@ -185,23 +189,38 @@ class VelaAgent:
             if Embedder.cosine_similarity(text_emb, cell_emb) > 0.55
         ]
 
-    def wfc_proactive(self) -> str | None:
-        """WFC 기반 능동 발화 — entropy 가장 낮은 셀을 꺼낸다."""
-        next_cell = self._wfc.get_next()
-        if not next_cell:
-            return None
-        self._wfc.collapse(next_cell.topic)
-        system = (
+    def _wfc_system(self, cell: ConversationCell) -> str:
+        return (
             f"당신은 사용자의 목표를 함께 달성하려는 파트너입니다.\n"
-            f"지금 반드시 짚어야 할 사안: '{next_cell.topic}'\n"
-            f"이유: {next_cell.description}\n\n"
+            f"지금 반드시 짚어야 할 사안: '{cell.topic}'\n"
+            f"이유: {cell.description}\n\n"
             f"사용자가 묻기를 기다리지 말고 먼저 이 주제를 꺼내세요. "
             f"단순히 '이 주제 얘기해봐요'가 아니라, "
             f"왜 지금 이게 중요한지 구체적인 이유와 함께 당신의 의견을 직접 말하세요. "
             f"필요하다면 사용자의 선택이나 방향에 의문을 제기해도 됩니다. "
             f"2-3문장. {_LANG}"
         )
-        response = self._llm.chat(self._context.to_messages(), system=system)
+
+    def wfc_proactive_stream(self) -> Iterator[str]:
+        """WFC 기반 능동 발화 스트리밍 버전."""
+        next_cell = self._wfc.get_next()
+        if not next_cell:
+            return
+        self._wfc.collapse(next_cell.topic)
+        accumulated: list[str] = []
+        for token in self._llm.chat_stream(self._context.to_messages(), system=self._wfc_system(next_cell)):
+            accumulated.append(token)
+            yield token
+        self._context.add("assistant", "".join(accumulated))
+        self._prima.mark_intervened()
+
+    def wfc_proactive(self) -> str | None:
+        """비스트리밍 SDK용."""
+        next_cell = self._wfc.get_next()
+        if not next_cell:
+            return None
+        self._wfc.collapse(next_cell.topic)
+        response = self._llm.chat(self._context.to_messages(), system=self._wfc_system(next_cell))
         self._context.add("assistant", response)
         self._prima.mark_intervened()
         return response
@@ -221,38 +240,50 @@ class VelaAgent:
         """대화 맥락 기반 WFC 초기화 — UI에서 chat() 직후 별도 호출."""
         self._init_wfc()
 
-    def chat(self, user_input: str) -> tuple[str, ConversationState, InitiativeDecision]:
+    def prepare_chat(self, user_input: str) -> tuple[list[dict], str, ConversationState]:
+        """스트리밍 전 단계: 유저 턴 추가, 상태 감지, messages/system 반환."""
+        self._last_user_input = user_input
         self._context.add("user", user_input)
         rag_results = self._retriever.search(user_input)
         state = self._state_detector.detect(self._context.get_user_turns())
-
         system = _SYSTEM_PROMPTS[state]
         if rag_results:
             system += f"\n\nRelevant context from documents:\n{chr(10).join(rag_results)}"
+        return self._context.to_messages(), system, state
 
-        response = self._llm.chat(self._context.to_messages(), system=system)
+    def finalize_chat(self, response: str, state: ConversationState) -> InitiativeDecision:
+        """스트리밍 완료 후 단계: 응답 저장, WFC collapse, PRIMA 판단."""
         self._context.add("assistant", response)
-
-        # WFC collapse
         if self._wfc.is_initialized():
-            for topic in self._detect_discussed_cells(user_input):
+            for topic in self._detect_discussed_cells(self._last_user_input):
                 self._wfc.collapse(topic)
-
-        # PRIMA 개입 판단 (LLM 호출 없음 — 순수 신호 계산)
         all_cells = self._wfc.get_all()
-        wfc_total = len(all_cells)
-        wfc_collapsed = sum(1 for c in all_cells if c.state == CellState.COLLAPSED)
-        decision = self._prima.compute(
+        return self._prima.compute(
             user_turns=self._context.get_user_turns(),
             state=state,
-            wfc_total=wfc_total,
-            wfc_collapsed=wfc_collapsed,
+            wfc_total=len(all_cells),
+            wfc_collapsed=sum(1 for c in all_cells if c.state == CellState.COLLAPSED),
         )
 
+    def chat(self, user_input: str) -> tuple[str, ConversationState, InitiativeDecision]:
+        """비스트리밍 SDK용. UI는 prepare_chat / finalize_chat을 사용할 것."""
+        messages, system, state = self.prepare_chat(user_input)
+        response = self._llm.chat(messages, system=system)
+        decision = self.finalize_chat(response, state)
         return response, state, decision
 
+    def prima_intervene_stream(self, initiative_type: InitiativeType) -> Iterator[str]:
+        """PRIMA 전략에 맞는 능동 발화를 스트리밍으로 생성."""
+        system = _INITIATIVE_PROMPTS[initiative_type]
+        accumulated: list[str] = []
+        for token in self._llm.chat_stream(self._context.to_messages(), system=system):
+            accumulated.append(token)
+            yield token
+        self._context.add("assistant", "".join(accumulated))
+        self._prima.mark_intervened()
+
     def prima_intervene(self, initiative_type: InitiativeType) -> str:
-        """PRIMA가 결정한 initiative_type에 맞는 능동 발화를 생성한다."""
+        """비스트리밍 SDK용."""
         system = _INITIATIVE_PROMPTS[initiative_type]
         response = self._llm.chat(self._context.to_messages(), system=system)
         self._context.add("assistant", response)
