@@ -141,6 +141,7 @@ class VelaAgent:
         self._wfc = ConversationWFC()
         self._prima = PRIMAEngine()
         self._last_user_input: str = ""
+        self._doc_preview: str = ""
         self.feedback = FeedbackLogger()
 
     # ── 문서 ─────────────────────────────────────────────────────────────
@@ -151,16 +152,35 @@ class VelaAgent:
         return len(chunks)
 
     def analyze_document(self) -> str:
-        """문서 로드 직후 호출 — 에이전트가 먼저 분석 메시지를 생성하고 WFC를 초기화한다."""
+        """비스트리밍 SDK용."""
         sample = self._retriever.search("주요 주제 개요 요약", top_k=3)
         if not sample:
             return ""
-        preview = "\n\n".join(sample)
-        messages = [{"role": "user", "content": f"문서 내용:\n{preview}"}]
+        self._doc_preview = "\n\n".join(sample)
+        messages = [{"role": "user", "content": f"문서 내용:\n{self._doc_preview}"}]
         response = self._llm.chat(messages, system=_DOCUMENT_ANALYSIS_PROMPT)
         self._context.add("assistant", response)
-        self._init_wfc_from_text(preview)
+        self._init_wfc_from_text(self._doc_preview)
         return response
+
+    def analyze_document_stream(self) -> Iterator[str]:
+        """UI용 스트리밍 분석 — WFC 초기화는 포함하지 않음."""
+        sample = self._retriever.search("주요 주제 개요 요약", top_k=3)
+        if not sample:
+            return
+        self._doc_preview = "\n\n".join(sample)
+        messages = [{"role": "user", "content": f"문서 내용:\n{self._doc_preview}"}]
+        accumulated: list[str] = []
+        for token in self._llm.chat_stream(messages, system=_DOCUMENT_ANALYSIS_PROMPT):
+            accumulated.append(token)
+            yield token
+        if accumulated:
+            self._context.add("assistant", "".join(accumulated))
+
+    def init_wfc_from_document(self) -> None:
+        """analyze_document_stream() 완료 후 호출 — 저장된 문서 미리보기로 WFC 초기화."""
+        if self._doc_preview:
+            self._init_wfc_from_text(self._doc_preview)
 
     # ── WFC ──────────────────────────────────────────────────────────────
 

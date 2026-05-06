@@ -103,8 +103,10 @@ def _render_sidebar(agent: VelaAgent) -> None:
                 try:
                     count = agent.load_document(tmp_path)
                     st.success(f"✅ {uploaded.name} 로드 완료 ({count}개 청크)")
-                    with st.spinner("문서 분석 + 대화 공간 구성 중..."):
-                        analysis = agent.analyze_document()
+                    st.caption("📄 문서 분석 중...")
+                    analysis = st.write_stream(agent.analyze_document_stream())
+                    with st.spinner("대화 공간 구성 중..."):
+                        agent.init_wfc_from_document()
                     st.session_state.analyzed_files.add(file_key)
                     st.session_state.last_suggestions = []
                     if analysis:
