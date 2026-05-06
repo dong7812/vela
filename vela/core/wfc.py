@@ -1,5 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vela.core.embedder import Embedder
+
+# Minimum cosine similarity between a cell's description and the source context
+# for the cell to be retained after quality filtering.
+# Reimers & Gurevych (2019): all-MiniLM-L6-v2 similarity < 0.15 indicates
+# semantically unrelated content. Set permissively to only remove clear outliers.
+_MIN_CELL_RELEVANCE = 0.15
 
 
 class CellState(str, Enum):
@@ -52,6 +64,35 @@ class ConversationWFC:
         """WFC 핵심: entropy 가장 낮은 미논의 셀 반환."""
         candidates = [c for c in self._cells.values() if c.state == CellState.SUPERPOSITION]
         return min(candidates, key=lambda c: c.entropy) if candidates else None
+
+    def filter_by_relevance(self, context: str, embedder: "Embedder") -> int:
+        """
+        P5: WFC 셀 품질 필터.
+        각 셀의 description을 소스 context와 비교해 관련성이 낮은 셀을 제거한다.
+        임계값 _MIN_CELL_RELEVANCE (0.15) 미만 셀은 LLM 환각으로 판단.
+
+        Reimers & Gurevych (2019): all-MiniLM-L6-v2에서 코사인 유사도 < 0.15는
+        의미적으로 무관한 내용임을 의미.
+
+        Returns: 제거된 셀 수
+        """
+        if not self._cells or not context.strip():
+            return 0
+
+        topics = list(self._cells.keys())
+        texts = [context] + [f"{t}: {self._cells[t].description}" for t in topics]
+        embeddings = embedder.embed(texts)
+        context_emb = embeddings[0]
+
+        from vela.core.embedder import Embedder as _Embedder
+        to_remove = [
+            topic
+            for i, topic in enumerate(topics)
+            if _Embedder.cosine_similarity(context_emb, embeddings[i + 1]) < _MIN_CELL_RELEVANCE
+        ]
+        for topic in to_remove:
+            del self._cells[topic]
+        return len(to_remove)
 
     def is_initialized(self) -> bool:
         return bool(self._cells)
