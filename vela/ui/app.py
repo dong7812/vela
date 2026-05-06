@@ -220,17 +220,19 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # 1. 응답 생성 + PRIMA 판단
+        # 1. 스트리밍 응답
+        try:
+            messages, system, detected_state = agent.prepare_chat(user_input)
+        except Exception as e:
+            st.error(f"오류가 발생했습니다: {e}\nOllama가 실행 중인지 확인해 주세요.")
+            st.stop()
+
         with st.chat_message("assistant"):
-            with st.spinner("생각 중..."):
-                try:
-                    response, detected_state, decision = agent.chat(user_input)
-                except Exception as e:
-                    st.error(f"오류가 발생했습니다: {e}\nOllama가 실행 중인지 확인해 주세요.")
-                    st.stop()
-            st.markdown(response)
+            response = st.write_stream(agent._llm.chat_stream(messages, system))
             label, color = _STATE_LABELS[detected_state]
             st.caption(f":{color}[{label}]")
+
+        decision = agent.finalize_chat(response, detected_state)
 
         st.session_state.messages.append(
             {"role": "assistant", "content": response, "state": detected_state}
@@ -244,34 +246,33 @@ def main() -> None:
                 agent.init_wfc()
 
         # 3. PRIMA 능동 개입 — 점수가 임계값을 넘을 때만 개입
-        proactive_msg = None
         proactive_tag = None
+        proactive_text = None
 
         if decision.should_intervene:
             i_type = decision.initiative_type
 
-            # INFORMATION + WFC 다음 셀이 있으면 WFC 주제 특화 발화 우선 사용
+            # INFORMATION + WFC 다음 셀 → WFC 주제 특화 발화 우선
             if i_type == InitiativeType.INFORMATION and agent.get_wfc_next():
-                with st.spinner("다음 주제 꺼내는 중..."):
-                    proactive_msg = agent.wfc_proactive()
                 next_cell = agent.get_wfc_next()
                 proactive_tag = f"🌊 WFC · {next_cell.topic if next_cell else '대화 공간 탐색'}"
+                with st.chat_message("assistant"):
+                    proactive_text = st.write_stream(agent.wfc_proactive_stream())
+                    st.caption(proactive_tag)
             else:
                 i_label, i_color = _INITIATIVE_LABELS[i_type]
-                with st.spinner(f"Vela 개입 중... ({i_label})"):
-                    proactive_msg = agent.prima_intervene(i_type)
                 proactive_tag = f":{i_color}[{i_label}] — PRIMA {int(decision.score * 100)}%"
+                with st.chat_message("assistant"):
+                    proactive_text = st.write_stream(agent.prima_intervene_stream(i_type))
+                    st.caption(proactive_tag)
 
-        if proactive_msg:
-            with st.chat_message("assistant"):
-                st.markdown(proactive_msg)
-                st.caption(proactive_tag or "🎯 Vela 능동 개입")
+        if proactive_text:
             st.session_state.messages.append(
-                {"role": "assistant", "content": proactive_msg,
+                {"role": "assistant", "content": proactive_text,
                  "state": detected_state, "tag": proactive_tag}
             )
         else:
-            # PRIMA가 개입하지 않기로 결정 → 선제 질문 제안
+            # PRIMA 미개입 → 선제 질문 제안
             with st.spinner("질문 제안 중..."):
                 st.session_state.last_suggestions = agent.suggest_questions()
             st.session_state.suggestion_key += 1
