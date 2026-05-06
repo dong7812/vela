@@ -1,3 +1,5 @@
+from typing import Iterator
+
 import anthropic
 
 from vela.llm.base import BaseLLM
@@ -15,21 +17,29 @@ class ClaudeLLM(BaseLLM):
         self._client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-    def chat(self, messages: list[dict[str, str]], system: str = "") -> str:
-        # Claude requires the last message to be from the user
+    def _trim(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
         trimmed = list(messages)
         while trimmed and trimmed[-1]["role"] == "assistant":
             trimmed.pop()
-        if not trimmed:
-            trimmed = [{"role": "user", "content": "계속해주세요."}]
+        return trimmed or [{"role": "user", "content": "계속해주세요."}]
 
+    def chat(self, messages: list[dict[str, str]], system: str = "") -> str:
         response = self._client.messages.create(
             model=self.model,
             max_tokens=2048,
             system=system or "You are a helpful assistant.",
-            messages=trimmed,
+            messages=self._trim(messages),
         )
         return response.content[0].text
+
+    def chat_stream(self, messages: list[dict[str, str]], system: str = "") -> Iterator[str]:
+        with self._client.messages.stream(
+            model=self.model,
+            max_tokens=2048,
+            system=system or "You are a helpful assistant.",
+            messages=self._trim(messages),
+        ) as stream:
+            yield from stream.text_stream
 
     def is_available(self) -> bool:
         try:
