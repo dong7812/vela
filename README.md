@@ -12,10 +12,7 @@ Vela v3    →  실제 데이터 편차 감지 (객관적, 수치화 가능)
 
 ## Table of Contents
 
-- [기존 SDK와의 차이](#기존-sdk와의-차이)
 - [3-Layer Pipeline](#3-layer-pipeline)
-- [대화 도메인 — 실제 흐름](#대화-도메인--실제-흐름)
-- [팬덤 도메인 — 실제 흐름](#팬덤-도메인--실제-흐름)
 - [설치](#설치)
 - [빠른 시작](#빠른-시작)
 - [SDK 레퍼런스](#sdk-레퍼런스)
@@ -28,22 +25,9 @@ Vela v3    →  실제 데이터 편차 감지 (객관적, 수치화 가능)
 
 ---
 
-## 기존 SDK와의 차이
-
-| | LangChain / LlamaIndex | **Vela v3** |
-|---|---|---|
-| 개입 방식 | 사용자 호출 시에만 반응 | 데이터 편차 감지 시 능동 개입 |
-| 적용 범위 | 고정된 RAG/Agent 파이프라인 | DomainPlugin으로 임의 도메인 확장 |
-| LLM 비용 | 모든 요청 LLM 호출 | Layer 01(로컬)에서 ~95% 차단, LLM은 마지막 수단 |
-| 도메인 신호 | 텍스트 쿼리만 | 행동 데이터·수치 편차·시계열 이상 등 |
-| 대화 도메인 | 지원 없음 | PRIMA + WFC + ESConv 내장 |
-| 백그라운드 | 없음 | VelaScheduler — 사용자가 앱을 열지 않아도 실행 |
-
----
-
 ## 3-Layer Pipeline
 
-모든 도메인이 공유하는 실행 구조입니다. 도메인마다 **Layer 01·02 구현체만 교체**하면 됩니다.
+모든 도메인이 공유하는 실행 구조. 도메인마다 **Layer 01·02 구현체만 교체**하면 됩니다.
 
 ```
 입력: current(현재 데이터 스냅샷) + history(과거 데이터)
@@ -61,7 +45,7 @@ Vela v3    →  실제 데이터 편차 감지 (객관적, 수치화 가능)
                     │ ~5%만 통과
           ┌─────────▼──────────┐
           │   Layer 02         │  단순 케이스: 조건 분기($0)
-          │   Intent           │  복합 케이스: Claude Haiku
+          │   Intent           │  복합 케이스: Claude Haiku (선택)
           │   Classifier       │
           │                    │
           │  intent = classify(signal)
@@ -81,200 +65,20 @@ Vela v3    →  실제 데이터 편차 감지 (객관적, 수치화 가능)
               OutputResult
 ```
 
-**`DomainPlugin`** 은 Layer 01·02 구현체 + 도메인 프롬프트를 묶는 컨테이너입니다.
+`DomainPlugin`은 Layer 01·02 구현체 + 도메인 프롬프트를 묶는 컨테이너입니다.
 
 ```python
 class DomainPlugin(ABC):
-    def get_signal_detector(self)  -> BaseSignalDetector:   ...  # Layer 01
-    def get_intent_classifier(self) -> BaseIntentClassifier: ...  # Layer 02
-    def get_output_prompt(self)    -> str:                   ...  # Layer 03 시스템 프롬프트
-```
-
----
-
-## 대화 도메인 — 실제 흐름
-
-대화 도메인은 **WFC + PRIMA + ESConv** 세 엔진이 협력합니다.  
-사용자 발화가 들어올 때마다 아래 순서로 실행됩니다.
-
-```
-사용자: "로컬 스토리지를 쓰려는데 어떻게 하면 될까요?"
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 01 · PrimaSignalDetector              │
-    │                                              │
-    │  ① 대화 상태 감지 (StateDetector)            │
-    │     최근 3턴 발화를 임베딩 → 코사인 유사도   │
-    │     avg_similarity = 0.72 → DEEPENING        │
-    │     stagnation = 0.3                         │
-    │                                              │
-    │  ② WFC coverage_gap 계산                     │
-    │     전체 셀 5개 중 논의된 셀 1개             │
-    │     coverage_gap = (5-1)/5 = 0.80            │
-    │                                              │
-    │  ③ 기타 신호                                 │
-    │     confusion        = 0.0  (의문형 없음)    │
-    │     engagement_decay = 0.15 (발화 충분)      │
-    │     initiative_debt  = 0.40 (3턴째 반응 중)  │
-    │                                              │
-    │  ④ PRIMA 점수 계산                           │
-    │     score = 0.35×0.3 + 0.25×0.0             │
-    │           + 0.20×0.80 + 0.12×0.15           │
-    │           + 0.08×0.40                       │
-    │           = 0.105+0+0.16+0.018+0.032 = 0.315│
-    │                                              │
-    │     0.315 < 0.38 (threshold)                 │
-    │     → should_act = False → Layer 02 진행 안함│
-    │     → fallback: 선제 질문 3개 생성           │
-    └──────────────────────────────────────────────┘
-
-사용자: "모르겠어요... 왜 이게 이렇게 복잡하죠?"
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 01 · PrimaSignalDetector              │
-    │                                              │
-    │  ① 대화 상태: avg_similarity = 0.91 → LOOPING│
-    │     stagnation = 0.7                         │
-    │                                              │
-    │  ② WFC coverage_gap = 0.80 (여전히 4개 남음) │
-    │                                              │
-    │  ③ confusion = 0.7  ("왜" + "?" 감지)        │
-    │     engagement_decay = 0.55 (짧은 발화)      │
-    │     initiative_debt  = 0.80 (4턴째)          │
-    │                                              │
-    │  ④ score = 0.35×0.7 + 0.25×0.7              │
-    │          + 0.20×0.80 + 0.12×0.55            │
-    │          + 0.08×0.80                        │
-    │          = 0.245+0.175+0.16+0.066+0.064     │
-    │          = 0.710                            │
-    │                                              │
-    │     0.710 ≥ 0.38 → should_act = True         │
-    └───────────────┬──────────────────────────────┘
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 02 · WfcIntentClassifier              │
-    │                                              │
-    │  PRIMA 결정: confusion=0.7 → RESTATEMENT     │
-    │  (confusion ≥ 0.5 하드 트리거)               │
-    │                                              │
-    │  → type=INFO, intent=NEED_INFO, urgency=0.50 │
-    └───────────────┬──────────────────────────────┘
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 03 · OutputGenerator (LLM)            │
-    │                                              │
-    │  system: ESConv RESTATEMENT 프롬프트          │
-    │  → "제가 이해한 바로는, 백엔드 없이 이메일을  │
-    │     보내는 방법을 찾고 계신 거죠?            │
-    │     어떤 부분이 제일 막히시나요?"            │
-    └──────────────────────────────────────────────┘
-```
-
-### PRIMA가 INFORMATION을 선택하면 WFC가 개입
-
-PRIMA가 `INFORMATION` 전략을 선택하고 미논의 WFC 셀이 남아 있으면,  
-`VelaAgent`는 `wfc_proactive()`를 호출해 entropy 최저 셀을 꺼냅니다.
-
-```
-PRIMA → INFORMATION + WFC 셀 남음
-                    │
-    WFC: 현재 대화 공간 (1/5 논의됨)
-    ✅  ~~백엔드 구조~~
-    ▶️  이메일 전송 방식  ← entropy=0.12 (최저, 다음 주제)
-    ○   포트폴리오 접근 범위
-    ○   상태 관리 전략
-    ○   보안 고려사항
-                    │
-    Layer 03: "이메일 전송을 살펴봐야 할 것 같아요.
-              백엔드 없이 보내려면 외부 서비스가 필요한데,
-              생각해두신 게 있나요?"
-```
-
-### 대화 상태 → stagnation 값
-
-| 상태 | 유사도 범위 | stagnation | PRIMA 반응 |
-|---|---|---|---|
-| `EXPLORING` | < 0.60 | 0.0 | 개입 없음 |
-| `DEEPENING` | 0.60–0.85 | 0.3 | coverage_gap 높으면 개입 가능 |
-| `LOOPING` | 0.85–0.95 | 0.7 | 2턴 지속 시 REFLECTION |
-| `STUCK` | ≥ 0.95 | 1.0 | 즉시 REFRAME |
-
-### ESConv 전략 선택 기준
-
-| 전략 | 조건 |
-|---|---|
-| `REFRAME` | stagnation ≥ 1.0 (STUCK 즉시 발화) |
-| `REFLECTION` | stagnation ≥ 0.7, 2턴 연속 (Bohus & Rudnicky 2005) |
-| `RESTATEMENT` | confusion ≥ 0.5 하드 트리거 |
-| `INFORMATION` | coverage_gap ≥ 0.5 + WFC 셀 연계 |
-| `SUGGESTION` | engagement_decay ≥ 0.5 급락 |
-| `AFFIRMATION` | engagement 소폭 하락 + debt ≥ 0.6 |
-| `QUESTION` | initiative_debt ≥ 0.6 |
-| `SELF_DISCLOSURE` | 그 외 soft-score 통과 케이스 |
-
----
-
-## 팬덤 도메인 — 실제 흐름
-
-```
-사용자 "팬_A"의 오늘 행동 데이터:
-  activity_count   = 1   (평소 12회)
-  content_skip_rate = 0.9 (공식 영상 90% 건너뜀)
-  session_hour     = 4   (평소 새벽 2시, 오늘 새벽 4시)
-  comeback_imminent = True
-  purchase_signal  = 0.85
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 01 · FanSignalDetector                │
-    │                                              │
-    │  baseline (과거 14일 평균):                   │
-    │    avg_activity    = 12.0                    │
-    │    avg_session_hour = 2.0                    │
-    │                                              │
-    │  편차 계산:                                   │
-    │    activity_deviation  = |1-12|/12  = 0.917  │
-    │    content_skip_rate   =            0.900    │
-    │    session_time_shift  = |4-2|/12   = 0.167  │
-    │    purchase_signal     =            0.850    │
-    │                                              │
-    │  score = 0.40×0.917 + 0.30×0.900            │
-    │        + 0.20×0.167 + 0.10×0.850            │
-    │        = 0.367+0.270+0.033+0.085 = 0.755    │
-    │                                              │
-    │  0.755 ≥ 0.50 (threshold) → should_act=True  │
-    └───────────────┬──────────────────────────────┘
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 02 · FanIntentClassifier              │
-    │                                              │
-    │  comeback_imminent = True                    │
-    │  → 첫 번째 조건 즉시 매칭 (LLM 없음)         │
-    │  → OPPORTUNITY / NEED_ACTION / urgency=0.95  │
-    └───────────────┬──────────────────────────────┘
-                    │
-    ┌───────────────▼──────────────────────────────┐
-    │  Layer 03 · OutputGenerator (LLM)            │
-    │                                              │
-    │  system: FandomDomainPlugin.get_output_prompt│
-    │  → "오늘 밤 12시 컴백이에요. 알림 설정할까요?"│
-    └──────────────────────────────────────────────┘
-```
-
-Layer 02 조건 분기 순서 (위에서 매칭되면 LLM 호출 없이 즉시 반환):
-
-```python
-if comeback_imminent:                                 → OPPORTUNITY urgency=0.95
-if activity_deviation > 0.7 and days_inactive >= 3:  → WARNING     urgency=0.85
-if purchase_signal > 0.6:                            → OPPORTUNITY urgency=0.80
-if is_new_fan:                                       → INFO        urgency=0.50
-# 위 조건 모두 미해당 → 복합 케이스 → Claude Haiku 호출
+    def get_signal_detector(self)   -> BaseSignalDetector:    ...  # Layer 01
+    def get_intent_classifier(self) -> BaseIntentClassifier:  ...  # Layer 02
+    def get_output_prompt(self)     -> str:                   ...  # Layer 03 시스템 프롬프트
 ```
 
 ---
 
 ## 설치
 
-**요구사항**: Python 3.10+, [Ollama](https://ollama.com)
+**요구사항**: Python 3.10+
 
 ```bash
 git clone https://github.com/dong7812/vela.git
@@ -283,12 +87,13 @@ cd vela
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# Ollama 모델 준비 (최초 1회)
-ollama pull qwen2.5:3b
 ```
 
-**RAM 가이드**
+로컬 LLM 사용 시 [Ollama](https://ollama.com) 추가 필요:
+
+```bash
+ollama pull qwen2.5:3b
+```
 
 | 모델 | 필요 RAM | 비고 |
 |---|---|---|
@@ -350,28 +155,44 @@ from vela import VelaAgent
 
 agent = VelaAgent()   # 기본값: Ollama
 
-# 문서 로드 → 자동 분석 → WFC 초기화
+# 문서 로드 → WFC 초기화
 agent.load_document("requirements.pdf")
+
+# 비스트리밍 분석
 analysis = agent.analyze_document()
+
+# 스트리밍 분석 (UI용) — WFC 초기화는 완료 후 별도 호출
+for token in agent.analyze_document_stream():
+    print(token, end="", flush=True)
+agent.init_wfc_from_document()
 
 # 대화 (비스트리밍)
 response, state, decision = agent.chat("질문 내용")
 # state    → EXPLORING / DEEPENING / LOOPING / STUCK
-# decision → should_intervene, initiative_type, score, signals
+# decision → should_intervene, initiative_type, score
 
 if decision.should_intervene:
     if decision.initiative_type.value == "INFORMATION" and agent.get_wfc_next():
-        msg = agent.wfc_proactive()                        # WFC 다음 주제 발화
+        msg = agent.wfc_proactive()                            # WFC 다음 주제 발화
     else:
         msg = agent.prima_intervene(decision.initiative_type)  # ESConv 전략 발화
 else:
-    questions = agent.suggest_questions()                  # 선제 질문 3개 fallback
+    questions = agent.suggest_questions()                      # 선제 질문 3개 fallback
 
-# 스트리밍 (UI 연동)
+# 대화 (스트리밍 — UI용)
 messages, system, state = agent.prepare_chat(user_input)
+accumulated = []
 for token in agent._llm.chat_stream(messages, system):
+    accumulated.append(token)
     print(token, end="", flush=True)
-decision = agent.finalize_chat(full_response, state)
+decision = agent.finalize_chat("".join(accumulated), state)
+
+# 스트리밍 개입 발화
+for token in agent.prima_intervene_stream(decision.initiative_type):
+    print(token, end="", flush=True)
+
+for token in agent.wfc_proactive_stream():
+    print(token, end="", flush=True)
 
 # WFC 상태 조회
 cells    = agent.get_wfc_cells()   # 전체 셀 목록
@@ -379,12 +200,12 @@ next_one = agent.get_wfc_next()    # entropy 최저 셀
 
 # PRIMA 피드백 통계
 summary = agent.feedback.get_summary()
-# {"REFRAME": {"count": 5, "success_rate": 0.80, "avg_length_ratio": 1.52}, ...}
+# {"REFRAME": {"count": 5, "success_rate": 0.80, ...}, ...}
+
+agent.reset()  # 대화 초기화
 ```
 
 ### 범용 파이프라인 — DomainPlugin 주입
-
-`VelaAgent(plugin=...)` 로 어떤 도메인이든 같은 인터페이스로 실행합니다.
 
 ```python
 from vela import VelaAgent, FandomDomainPlugin
@@ -405,8 +226,6 @@ result = pipeline.run(current=today_data, history=history)
 ```
 
 ### 백그라운드 실행 — VelaScheduler
-
-사용자가 앱을 열지 않아도 주기적으로 파이프라인을 실행합니다.
 
 ```python
 import asyncio
@@ -477,9 +296,12 @@ class BizOwnerIntentClassifier(BaseIntentClassifier):
                 urgency=0.75, confidence=0.90, reason="베스트셀러 재고 부족",
             )
 
-        # 복합 케이스 — Claude Haiku 호출
-        # 이유: 매출 감소 + 재고 부족 + 날씨 이벤트 동시 발생 → 조건 분기로 커버 불가
-        return self._llm_classify(signal)
+        # 복합 케이스 — 기본 분류로 fallback (LLM 연동은 도메인에서 직접 구현)
+        # 이유: 매출 감소 + 재고 부족 + 외부 이벤트 동시 발생 → 조건 분기로 커버 불가
+        return IntentResult(
+            type="INFO", intent="NEED_INFO",
+            urgency=signal.score, confidence=0.60, reason="복합 신호 감지",
+        )
 ```
 
 ### Step 3 — DomainPlugin 조합
@@ -602,7 +424,7 @@ pip install -e .
 **우선순위 항목**
 
 - [ ] 새 도메인 구현 — `bizowner`, `health`, `ecommerce` 등
-- [ ] `FanIntentClassifier` 복합 케이스 LLM 연동 완성
+- [ ] `FanIntentClassifier` 복합 케이스 Claude Haiku 연동
 - [ ] PRIMA 가중치 자동 튜닝 — `.vela_feedback.jsonl` 기반 Bayesian 최적화
 - [ ] VelaScheduler 푸시 알림 연동 (FCM, APNs)
 - [ ] OpenAI / Gemini / Bedrock LLM 구현체
